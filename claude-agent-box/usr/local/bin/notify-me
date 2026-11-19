@@ -1,0 +1,39 @@
+#!/usr/bin/python3 -I
+"""Ring your own doorbell: post a short message to YOUR Google Chat DM with the Vylo Agent bot.
+
+    notify-me "PR #123 is ready for your review: https://github.com/..."
+    notify-me <<'MSG'
+    Needs you: deploy voiceLog 1.4.2 to stage (I cannot deploy).
+    MSG
+
+It only ever reaches the person this agent belongs to. Use it for something the user must do or know: a decision,
+an approval waiting in the Claude app, a deploy or message only they can do, a long task that finished.
+The bot delivers within about 30 seconds; at most 20 messages an hour are delivered.
+"""
+import os
+import sys
+
+sys.path.insert(0, "/usr/local/lib/claude-agent")
+import agent_outbox  # noqa: E402
+
+
+def main(argv):
+    source = "agent"
+    args = list(argv)
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if args[:1] == ["--source"] and len(args) >= 2:
+        source, args = args[1], args[2:]
+    text = " ".join(args) if args else sys.stdin.read()
+    try:
+        agent_outbox.write(os.path.expanduser("~"), text, source)
+    except (ValueError, OSError) as e:
+        print("notify-me: %s" % e, file=sys.stderr)
+        return 1
+    print("queued for your Chat DM")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

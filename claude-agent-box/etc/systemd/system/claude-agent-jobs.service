@@ -1,0 +1,15 @@
+[Unit]
+Description=Vylo Agent scheduled jobs (reminders and headless tasks for each colleague)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root: it reads each colleague's jobs file and starts their runs as that colleague, in capped transient units.
+User=root
+ExecStart=/usr/local/bin/claude-agent-jobs
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

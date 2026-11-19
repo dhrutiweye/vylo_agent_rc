@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Start `claude remote-control` in a detached tmux session (named "agent", one tmux server per Linux
+# user). No-op if it already exists. Used by claude-agent.service (ubuntu) and claude-agent@<name>.service.
+# Per-user values come from the environment (systemd sets HOME for User=); defaults keep the original
+# single-agent setup working unchanged.
+set -euo pipefail
+export HOME=${HOME:-/home/ubuntu}
+export PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export TERM="${TERM:-xterm-256color}"
+export AGENT_NAME=${AGENT_NAME:-poc-agent}
+SESSION=agent
+# The vylo folder (all repos + context.md), so the agent starts where the context lives.
+WORKDIR=${AGENT_WORKDIR:-$HOME/Documents/code/vylo}
+
+mkdir -p "$WORKDIR"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  exit 0
+fi
+# agent-run keeps the loop alive if claude exits and reattaches to the saved session id.
+tmux new-session -d -s "$SESSION" -c "$WORKDIR" /usr/local/bin/agent-run

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Watchdog for every claude-agent@<name> instance, run every minute by claude-agent-watch-all.timer:
+#  - active but its tmux session died  -> restart the unit. (Restarting the unit, not starting tmux here, because a
+#    tmux server started by a oneshot watchdog would die with that unit's cgroup.)
+#  - failed and still enabled          -> start it again. A stop that had to kill stragglers (a docker client that
+#    ignored SIGTERM) ends "failed", and an agent left like that stayed down for good.
+# A deliberate `systemctl stop` that ends cleanly is "inactive" and is respected. To keep an agent off for good,
+# `systemctl disable --now` it: a disabled unit is never revived.
+for unit in $(systemctl list-units --plain --no-legend --state=active 'claude-agent@*.service' | awk '{print $1}'); do
+  n=${unit#claude-agent@}; n=${n%.service}
+  runuser -u "$n" -- tmux has-session -t agent 2>/dev/null || systemctl restart "$unit"
+done
+for unit in $(systemctl list-units --plain --no-legend --state=failed 'claude-agent@*.service' | awk '{print $1}'); do
+  systemctl is-enabled --quiet "$unit" || continue
+  echo "reviving failed $unit"
+  systemctl reset-failed "$unit"
+  systemctl start "$unit"
+done
+exit 0

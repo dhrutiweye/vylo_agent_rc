@@ -1,0 +1,7 @@
+# <folder-name on the box> <GitHub https url>. One per line. The folder names match the vylo workspace and context.md.
+AudioVerse_Claude https://github.com/WeyeTech/AudioVerse.git
+stt-platform https://github.com/WeyeTech/stt-platform.git
+voiceLog https://github.com/WeyeTech/voiceLog.git
+vylo_gpt https://github.com/WeyeTech/vylo_gpt.git
+vylo-one-landing-page https://github.com/WeyeTech/vylo-one-landing-page.git
+VyloVoiceDesktop https://github.com/WeyeTech/VyloVoiceDesktop.git

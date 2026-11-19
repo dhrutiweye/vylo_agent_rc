@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code Remote Control agent (tmux session "agent")
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Documents/code/vylo
+Environment=HOME=/home/ubuntu
+Environment=TERM=xterm-256color
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/agent-start
+ExecStop=-/usr/bin/tmux kill-session -t agent
+
+[Install]
+WantedBy=multi-user.target

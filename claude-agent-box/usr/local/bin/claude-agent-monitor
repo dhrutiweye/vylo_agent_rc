@@ -1,0 +1,337 @@
+#!/usr/bin/python3 -I
+"""Box-load monitor (root, claude-agent-monitor.timer, every 5 minutes). Writes one JSON line per run to
+/var/log/claude-agent-load.jsonl (outside /var/log/claude-agent/, whose *.jsonl files are per-person audit logs) and
+alerts the admin in Google Chat through their outbox, shown as [box]:
+
+  memory   available memory under 1.5 GB in two samples in a row
+  disk     free space on / under 10 GB
+  oom      the kernel killed a process inside claudeagents.slice (its memory.events oom_kill counter went up)
+
+At most one alert of each kind an hour. The admin is ADMIN_PERSON in /etc/claude-agent/bridge.env; without it the
+samples are still logged and nothing is sent. claude-agent-report --days N shows the Load section from the log.
+
+  sudo claude-agent-monitor            one sample now (what the timer runs)
+  sudo claude-agent-monitor --print    the sample, printed, nothing logged or sent
+"""
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LIB = "/usr/local/lib/claude-agent"
+LOAD_LOG = "/var/log/claude-agent-load.jsonl"
+STATE = "/var/lib/claude-agent/monitor-state.json"
+BRIDGE_ENV = "/etc/claude-agent/bridge.env"
+SLICE = "claudeagents.slice"
+
+MEM_LOW_MB = 1536           # 1.5 GB
+MEM_LOW_SAMPLES = 2
+DISK_LOW_GB = 10
+ALERT_EVERY = 3600          # one alert per kind per hour
+ACTIVE_SECONDS = 600        # a conversation with an audit row this recent counts as an active session
+SIZE_EVERY = 3600           # worktree sizes are walked once an hour, not every 5 minutes
+SIZE_BUDGET = 60            # seconds the walk may take; the unit is killed at 120 s
+CONVERSATION_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+@dataclasses.dataclass
+class Paths:
+    proc: str = "/proc"
+    cgroup: str = "/sys/fs/cgroup"
+    homes: str = "/home"
+    audit: str = "/var/log/claude-agent"
+    people: str = "/etc/claude-agent/people.json"
+    disk: str = "/"
+    load_log: str = LOAD_LOG
+    state: str = STATE
+
+
+# ------------------------------------------------------------------ reading
+def _read(path, limit=65536):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return None
+
+
+def _int(text):
+    try:
+        return int(text.strip())
+    except (AttributeError, ValueError):
+        return None
+
+
+def _events(path):
+    out = {}
+    for line in (_read(path) or "").splitlines():
+        k, _, v = line.partition(" ")
+        if _int(v) is not None:
+            out[k] = int(v)
+    return out
+
+
+def _mb(n):
+    return None if n is None else n // (1024 * 1024)
+
+
+def _iso(t):
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _parse_ts(s):
+    return dt.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def _active_sessions(audit_file, now):
+    try:
+        with open(audit_file, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262144))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0
+    seen = set()
+    for line in text.splitlines():
+        try:
+            e = json.loads(line)
+            if e.get("job") or not CONVERSATION_RE.match(e.get("session") or ""):
+                continue
+            if now - _parse_ts(e["ts"]) < ACTIVE_SECONDS:
+                seen.add(e["session"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return len(seen)
+
+
+def _real_dir(path):
+    """A directory that is not a symbolic link (this runs as root over folders the agents control)."""
+    return os.path.isdir(path) and not os.path.islink(path)
+
+
+def _worktree_dirs(home):
+    vylo = os.path.join(home, "Documents", "code", "vylo")
+    if not _real_dir(vylo):
+        return []
+    parents = [os.path.join(vylo, ".worktrees")]
+    parents += [os.path.join(vylo, r, ".claude", "worktrees") for r in _listdir(vylo)
+                if not r.startswith(".") and _real_dir(os.path.join(vylo, r)) and _real_dir(os.path.join(vylo, r, ".claude"))]
+    dirs = []
+    for parent in parents:
+        if _real_dir(parent):
+            dirs += [os.path.join(parent, d) for d in _listdir(parent) if _real_dir(os.path.join(parent, d))]
+    return dirs
+
+
+def _listdir(d):
+    try:
+        return sorted(os.listdir(d))
+    except OSError:
+        return []
+
+
+def _size_mb(top, deadline=None, clock=time.monotonic):
+    """Disk used under top, in MB, never following a link. None when the walk ran past the deadline."""
+    if not _real_dir(top):
+        return 0
+    total = 0
+    for root, dirs, files in os.walk(top, followlinks=False):
+        if deadline is not None and clock() > deadline:
+            return None
+        for name in files + dirs:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total // (1024 * 1024)
+
+
+def _people(path):
+    try:
+        with open(path) as f:
+            return [p.get("linux_user") for p in json.load(f).get("people", []) if USER_RE.match(p.get("linux_user") or "")]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def sample(paths, now, measure_sizes=False):
+    meminfo = {}
+    for line in (_read(os.path.join(paths.proc, "meminfo")) or "").splitlines():
+        k, _, v = line.partition(":")
+        meminfo[k.strip()] = _int(v.split()[0]) if v.split() else None
+    load = (_read(os.path.join(paths.proc, "loadavg")) or "").split()
+    try:
+        st = os.statvfs(paths.disk)
+        disk = round(st.f_bavail * st.f_frsize / 1024 ** 3, 1)
+    except OSError:
+        disk = None
+    sl = os.path.join(paths.cgroup, SLICE)
+    box = {"mem_available_mb": meminfo["MemAvailable"] // 1024 if meminfo.get("MemAvailable") is not None else None,
+           "disk_free_gb": disk,
+           "load1": float(load[0]) if load else None,
+           "oom_kills": _events(os.path.join(sl, "memory.events")).get("oom_kill")}
+    people = {}
+    for user in _people(paths.people):
+        cg = os.path.join(sl, "claude-agent@%s.service" % user)
+        if not os.path.isdir(cg):
+            continue
+        ev = _events(os.path.join(cg, "memory.events"))
+        procs = 0
+        for pid in (_read(os.path.join(cg, "cgroup.procs")) or "").split():
+            if (_read(os.path.join(paths.proc, pid, "comm")) or "").strip() == "claude":
+                procs += 1
+        home = os.path.join(paths.homes, user)
+        wts = _worktree_dirs(home)
+        p = {"mem_mb": _mb(_int(_read(os.path.join(cg, "memory.current")))),
+             "mem_peak_mb": _mb(_int(_read(os.path.join(cg, "memory.peak")))),
+             "high_events": ev.get("high"), "max_events": ev.get("max"),
+             "active_sessions": _active_sessions(os.path.join(paths.audit, user + ".jsonl"), now),
+             "claude_procs": procs, "worktrees": len(wts)}
+        if measure_sizes:
+            p["worktrees_mb"] = sum(_size_mb(d) for d in wts)
+        people[user] = p
+    return {"ts": _iso(now), "box": box, "people": people}
+
+
+# ------------------------------------------------------------------ deciding
+def _top(s, n=3):
+    ppl = sorted(s.get("people", {}).items(), key=lambda kv: -(kv[1].get("mem_mb") or 0))[:n]
+    return ", ".join("%s %.1f GB (%s active)" % (u, (p.get("mem_mb") or 0) / 1024, p.get("active_sessions", 0))
+                     for u, p in ppl) or "no agents running"
+
+
+def alerts(prev_state, s, now):
+    """(messages, new state). prev_state is what the previous run returned ({} the first time)."""
+    st = {"low_mem_streak": 0, "sent": dict(prev_state.get("sent") or {}), "oom_kills": prev_state.get("oom_kills")}
+    b, msgs = s["box"], []
+
+    def due(kind):
+        return now - st["sent"].get(kind, 0) >= ALERT_EVERY
+
+    mem = b.get("mem_available_mb")
+    if mem is not None and mem < MEM_LOW_MB:
+        st["low_mem_streak"] = (prev_state.get("low_mem_streak") or 0) + 1
+        if st["low_mem_streak"] >= MEM_LOW_SAMPLES and due("memory"):
+            msgs.append("Agent box memory is low: %.1f GB available for %d samples in a row. Biggest: %s."
+                        % (mem / 1024, st["low_mem_streak"], _top(s)))
+            st["sent"]["memory"] = now
+    disk = b.get("disk_free_gb")
+    if disk is not None and disk < DISK_LOW_GB and due("disk"):
+        msgs.append("Agent box disk is nearly full: %.1f GB free on /. Old worktrees and Docker images are the usual "
+                    "cause (claude-agent-report shows worktrees per person)." % disk)
+        st["sent"]["disk"] = now
+    oom = b.get("oom_kills")
+    if oom is not None:
+        before = prev_state.get("oom_kills")
+        if before is not None and oom > before and due("oom"):
+            msgs.append("The kernel killed %d process(es) in the agents' memory slice (out of memory). Biggest now: %s."
+                        % (oom - before, _top(s)))
+            st["sent"]["oom"] = now
+        st["oom_kills"] = oom
+    return msgs, st
+
+
+# ------------------------------------------------------------------ acting
+def _admin(env):
+    name = (env.get("ADMIN_PERSON") or "").strip()
+    return name if USER_RE.match(name) else None
+
+
+def bridge_env(path=BRIDGE_ENV):
+    env = {}
+    for line in (_read(path) or "").splitlines():
+        k, eq, v = line.partition("=")
+        if eq and not k.strip().startswith("#"):
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]                               # systemd's EnvironmentFile strips quotes; so do we
+            env[k.strip()] = v
+    return env
+
+
+def outbox_writer(person, text):
+    """Leave the message in the person's own outbox, written AS that person (the bridge only delivers their files)."""
+    import pwd
+    home = pwd.getpwnam(person).pw_dir
+    code = ("import os, sys; sys.path.insert(0, %r); import agent_outbox; "
+            "agent_outbox.write(os.environ['HOME'], sys.stdin.read(), 'box')" % LIB)
+    subprocess.run(["runuser", "-u", person, "--", "env", "HOME=" + home, "/usr/bin/python3", "-I", "-c", code],
+                   input=text, text=True, check=True, capture_output=True, timeout=30, cwd="/")
+
+
+def _load_state(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _log(path, row):
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def measure_sizes(paths, users, budget=SIZE_BUDGET, clock=time.monotonic):
+    """{user: MB of their worktrees}; a person whose walk ran out of time is None, and so is everyone after them."""
+    deadline, out = clock() + budget, {}
+    for user in users:
+        total = 0
+        for d in _worktree_dirs(os.path.join(paths.homes, user)):
+            mb = _size_mb(d, deadline, clock)
+            if mb is None:
+                total = None
+                break
+            total += mb
+        out[user] = total
+    return out
+
+
+def run(paths, now, env, writer=outbox_writer):
+    """Sample, log, alert and save the state FIRST; only then walk the worktrees (hourly) and log their sizes on a line
+    of their own. A walk that hangs or is killed can then never stop the sampling or the alerts."""
+    prev = _load_state(paths.state)
+    measure = now - (prev.get("sizes_at") or 0) >= SIZE_EVERY
+    s = sample(paths, now)
+    _log(paths.load_log, s)
+    msgs, state = alerts(prev, s, now)
+    admin = _admin(env)
+    if msgs and admin:
+        try:
+            for m in msgs:
+                writer(admin, m)
+        except Exception as e:                                # noqa: BLE001 - try again next run
+            print("could not alert %s: %s" % (admin, e), file=sys.stderr)
+            state["sent"], state["oom_kills"] = dict(prev.get("sent") or {}), prev.get("oom_kills")
+    state["sizes_at"] = now if measure else prev.get("sizes_at")
+    _save_state(paths.state, state)
+    if measure:
+        _log(paths.load_log, {"ts": s["ts"], "worktree_sizes_mb": measure_sizes(paths, sorted(s["people"]))})
+    return s, msgs
+
+
+def main(argv):
+    import time
+    if "--print" in argv:
+        print(json.dumps(sample(Paths(), time.time(), measure_sizes=True), indent=2))
+        return 0
+    run(Paths(), time.time(), bridge_env())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

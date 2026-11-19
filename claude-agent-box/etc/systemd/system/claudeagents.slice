@@ -1,0 +1,10 @@
+[Unit]
+Description=Every colleague's Claude agent and scheduled job, together
+Before=slices.target
+
+# claude-agent@<name> units (Slice= in the unit) and claude-agent-jobs task units (systemd-run --slice) live here.
+# Each person is capped at 4 GB by claude-agent@.service.d/limits.conf; this caps all of them at 12 GB, leaving
+# the rest of a 16 GB box to the system, Docker and the bridge. claude-agent-monitor reads memory.events here.
+[Slice]
+MemoryAccounting=yes
+MemoryMax=12G

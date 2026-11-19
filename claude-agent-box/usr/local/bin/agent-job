@@ -1,0 +1,163 @@
+#!/usr/bin/python3 -I
+"""Scheduled jobs for this agent's user. Reminders post text to their Google Chat DM; tasks run a fresh headless
+Claude with a prompt and post the result there.
+
+  agent-job add NAME --when WHEN --remind "text"     a reminder
+  agent-job add NAME --when WHEN --task "prompt"     a task (use - to read the text or prompt from stdin)
+  agent-job list | show NAME | run NAME | pause NAME | resume NAME | remove NAME
+
+  WHEN: "at 16:00" | "at 2026-11-07 16:00" | "in 30m" | "every 2h" | "daily 09:30" | "weekdays 10:00"   (IST)
+
+Limits (set by the admin): 10 jobs, reminders at most every 15 minutes, tasks at most every hour and 24 task runs a
+day, each run up to 10 minutes. A task cannot ask for approval: anything that would need it is refused, so the
+task should say what the user must do instead. Times missed while the box was down run once when it is back.
+"""
+import json
+import os
+import pwd
+import sys
+import time
+
+sys.path.insert(0, "/usr/local/lib/claude-agent")
+import agent_jobs as aj  # noqa: E402
+
+HOME = os.path.expanduser("~")
+USER = pwd.getpwuid(os.getuid()).pw_name
+
+
+def die(msg):
+    print("agent-job: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def body_arg(v):
+    return sys.stdin.read() if v == "-" else v
+
+
+def runner_state():
+    return aj.load_state(USER, os.environ.get("AGENT_JOB_STATE_DIR", aj.STATE_DIR))
+
+
+def status_of(job, js, now, limits):
+    if aj.is_paused(job, js):
+        return "paused"
+    if job["schedule"]["type"] == "at" and js.get("done"):
+        return "done"
+    return js.get("last_status", "waiting")
+
+
+def cmd_add(args, store, limits):
+    if not args:
+        die("add NAME --when WHEN (--remind TEXT | --task PROMPT)")
+    name, opts, i = args[0], {}, 1
+    while i < len(args):
+        if args[i] in ("--when", "--remind", "--task") and i + 1 < len(args):
+            opts[args[i]] = args[i + 1]
+            i += 2
+        else:
+            die("unexpected %r" % args[i])
+    if ("--remind" in opts) == ("--task" in opts):
+        die("give exactly one of --remind TEXT or --task PROMPT")
+    if "--when" not in opts:
+        die("say when with --when")
+    kind = "remind" if "--remind" in opts else "task"
+    body = body_arg(opts["--remind"] if kind == "remind" else opts["--task"])
+    st = runner_state()
+
+    def add(d):
+        # one-off jobs that already ran make room automatically
+        d["jobs"] = [j for j in d["jobs"] if not (j.get("schedule", {}).get("type") == "at"
+                                                 and st["jobs"].get(j.get("name"), {}).get("done"))]
+        job = aj.new_job(name, kind, body, opts["--when"], time.time(), limits, d["jobs"])
+        d["jobs"].append(job)
+        return job
+    try:
+        job = store.change(add)
+    except ValueError as e:
+        die(str(e))
+    print("added %s: %s, %s" % (name, "reminder" if kind == "remind" else "task", aj.describe(job["schedule"], limits.tz)))
+
+
+def cmd_list(store, limits):
+    jobs, st, now = store.read()["jobs"], runner_state(), time.time()
+    if not jobs:
+        print("no jobs")
+        return
+    print("%-20s %-7s %-26s %-17s %-8s" % ("name", "kind", "when", "next", "status"))
+    for j in jobs:
+        if not aj.valid_job(j, limits):
+            print("%-20s (unreadable definition: remove it)" % j.get("name", "?"))
+            continue
+        js = st["jobs"].get(j["name"], {})
+        nxt = None if aj.is_paused(j, js) else aj.next_run(j, js, now, limits.tz, limits)
+        print("%-20s %-7s %-26s %-17s %-8s" % (j["name"], j["kind"], aj.describe(j["schedule"], limits.tz),
+                                                aj.fmt_time(nxt, limits.tz) if nxt else "-", status_of(j, js, now, limits)))
+    if st.get("task_runs_today") is not None:
+        print("task runs today: %d of %d" % (st.get("task_runs_today", 0), limits.daily_cap))
+
+
+def find(d, name):
+    for j in d["jobs"]:
+        if j.get("name") == name:
+            return j
+    raise ValueError("no job called %s" % name)
+
+
+def cmd_show(name, store, limits):
+    try:
+        j = find(store.read(), name)
+    except ValueError as e:
+        die(str(e))
+    js = runner_state()["jobs"].get(name, {})
+    print(json.dumps({"job": j, "runner": js}, indent=2))
+    p = os.path.join(HOME, aj.RESULTS_DIR, name + ".txt")
+    if os.path.exists(p):
+        print("\n--- last result (%s)" % aj.fmt_time(os.path.getmtime(p), limits.tz))
+        with open(p) as f:
+            print(f.read())
+
+
+def cmd_simple(verb, name, store):
+    def act(d):
+        j = find(d, name)
+        if verb == "remove":
+            d["jobs"].remove(j)
+        elif verb == "pause":
+            j["paused"] = True
+        elif verb == "resume":
+            j["paused"] = False
+            j["resumed_at"] = int(time.time())
+        elif verb == "run":
+            j["run_now"] = int(time.time())
+    try:
+        store.change(act)
+    except ValueError as e:
+        die(str(e))
+    print({"remove": "removed", "pause": "paused", "resume": "resumed",
+           "run": "will run within a minute"}[verb] + ": " + name)
+
+
+def main(argv):
+    limits, store = aj.load_limits(), aj.JobStore(HOME)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    verb, rest = argv[0], argv[1:]
+    if verb == "add":
+        cmd_add(rest, store, limits)
+    elif verb == "list":
+        cmd_list(store, limits)
+    elif verb in ("show", "remove", "pause", "resume", "run"):
+        if len(rest) != 1:
+            die("%s NAME" % verb)
+        if verb == "show":
+            cmd_show(rest[0], store, limits)
+        else:
+            cmd_simple(verb, rest[0], store)
+    else:
+        die("unknown command %r (see agent-job help)" % verb)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Runs inside the tmux session. Keeps ONE Remote Control session across restarts of the service,
+# the VM or the Mac, however long they were down.
+#
+# The session id is copied to ~/.claude/agent-session-id every 20 s while running (not only at
+# shutdown: a power cut or kill -9 never runs a shutdown hook). On start the id is reattached with
+# --session-id, which has no age limit; --continue (about 4 h) and a fresh session are fallbacks.
+# Per-user: HOME, AGENT_NAME (default poc-agent) and AGENT_WORKDIR come from the environment.
+# How many sessions: `agent-max-sessions` (the admin's /etc/claude-code/agent-sessions.conf, forced to 1 when the
+# person's org policy would make Claude skip the box's guard), read again before every start.
+# - 1 (the default): one session. A fresh start passes --capacity 1, so the app cannot spawn extra sessions on
+#   the box. (--session-id and --continue reattach one session and are single-session by themselves; claude
+#   refuses either one combined with --capacity.)
+# - N > 1: server mode, `--capacity N --spawn same-dir`. The person opens and closes sessions in the app. A
+#   restart brings back the sessions that were open less than about 4 hours ago; older ones cannot be restored.
+#   The limit wins: --capacity is always passed, so a restart that cannot restore every session under it ends
+#   the rest. --no-create-session-in-dir is never used: it archives sessions on stop.
+#   Lowering N to 1 falls back to the single-session chain below on the next start.
+# "new session" / "switch N" in Chat: the bridge stops the service, changes agent-session-id (or leaves
+# ~/.claude/agent-fresh for a brand-new session) and starts it again. The fresh flag stays until save_id has
+# seen the new session: a fresh start that fails (claude says the folder is "already served" for a while after
+# a stop) is retried as a fresh start, not with --continue, which would quietly reopen the old conversation.
+export HOME=${HOME:-/home/ubuntu}
+export PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR=${AGENT_WORKDIR:-$HOME/Documents/code/vylo}
+STATE="$HOME/.claude/agent-session-id"
+POINTER="$HOME/.claude/projects/$(sed 's/[^A-Za-z0-9]/-/g' <<<"$WORKDIR")/bridge-pointer.json"
+NAME=${AGENT_NAME:-poc-agent}
+FRESH="$HOME/.claude/agent-fresh"     # left by the Chat bridge's "new session": start a new conversation once
+# The box's own helper, by absolute path: $HOME/.local/bin comes first on PATH and the agent can write there.
+HELPER=/usr/local/bin/agent-max-sessions
+[ "$(realpath "$0" 2>/dev/null)" = /usr/local/bin/agent-run ] || HELPER=${AGENT_MAX_SESSIONS_BIN:-$HELPER}   # tests only
+
+save_id() {
+  while sleep 20; do
+    id=$(jq -r '.sessionId // empty' "$POINTER" 2>/dev/null || true)
+    if [ -n "$id" ] && [ "$id" != "$(cat "$STATE" 2>/dev/null || true)" ]; then
+      echo "$id" > "$STATE"
+      rm -f "$FRESH"                  # the new session is up: later restarts reattach it
+    fi
+  done
+}
+save_id &
+trap 'kill $! 2>/dev/null' EXIT
+
+while true; do
+  ID=$(cat "$STATE" 2>/dev/null || true)
+  N=$("$HELPER" 2>/dev/null || true)
+  [[ $N =~ ^[1-5]$ ]] || N=1
+  if [ "$N" -gt 1 ]; then
+    claude remote-control --name "$NAME" --capacity "$N" --spawn same-dir
+  elif [ -f "$FRESH" ]; then
+    rm -f "$STATE" "$POINTER"
+    claude remote-control --name "$NAME" --capacity 1
+  elif [ -n "$ID" ]; then
+    claude remote-control --name "$NAME" --session-id "$ID" \
+      || claude remote-control --name "$NAME" --continue \
+      || claude remote-control --name "$NAME" --capacity 1
+  else
+    claude remote-control --name "$NAME" --continue || claude remote-control --name "$NAME" --capacity 1
+  fi
+  rc=$?
+  [ -n "${AGENT_RUN_ONCE:-}" ] && exit "$rc"     # tests only: one start, no restart
+  echo "[agent-run] claude exited ($rc), restarting in 10s"
+  sleep 10
+done

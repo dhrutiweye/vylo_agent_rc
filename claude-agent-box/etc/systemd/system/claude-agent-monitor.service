@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample the agent box's load and alert the admin (memory, disk, out-of-memory kills)
+After=claudeagents.slice
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/claude-agent-monitor
+Nice=10
+TimeoutStartSec=120

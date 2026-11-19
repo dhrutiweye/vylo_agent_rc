@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Adoption report from the audit logs in /var/log/claude-agent/*.jsonl.
+
+  claude-agent-report                  last 24 hours, plain text
+  claude-agent-report --days 7         last 7 days
+  claude-agent-report --date 2026-11-04   that UTC day
+  claude-agent-report --json           the same numbers as JSON
+  claude-agent-report --dir PATH       read logs from PATH (default /var/log/claude-agent)
+  claude-agent-report --load-file PATH box-load samples (default /var/log/claude-agent-load.jsonl)
+
+Counts: active users (sent at least one prompt), sessions, prompts, tool calls, draft PRs created,
+guard denies/asks, Chat nudges, and "idle waits": from a notification (the agent waiting for the user)
+to the next prompt, tool call or stop. Needs read access to every user's log: run it as root.
+
+Load, per UTC day, from claude-agent-monitor's samples: the most sessions active at once per person and on the
+whole box, the lowest memory available, each person's peak memory, how often they hit their memory limits
+(high = slowed down, max = at the cap) and out-of-memory kills.
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+WAIT_CLEARS = {"prompt", "tool", "stop", "session_end"}
+LOAD_FILE = "/var/log/claude-agent-load.jsonl"
+NOT_A_PERSON = {"claude-agent-load.jsonl", "box-load.jsonl"}   # monitor output, never an audit log
+
+
+def parse_ts(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+
+
+def load(dirpath, start, end):
+    rows = []
+    for path in sorted(glob.glob(os.path.join(dirpath, "*.jsonl"))):
+        if os.path.basename(path) in NOT_A_PERSON:
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    t = parse_ts(e["ts"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if not isinstance(e.get("event"), str):  # not an audit row (a load sample has none)
+                    continue
+                if start <= t < end:
+                    e["_t"] = t
+                    rows.append(e)
+    rows.sort(key=lambda e: e["_t"])
+    return rows
+
+
+def waits(events):
+    """Minutes the agent waited on the user, one number per notification episode that was answered."""
+    out, open_at = [], None
+    for e in events:
+        if e["event"] == "notification" and open_at is None:
+            open_at = e["_t"]
+        elif e["event"] in WAIT_CLEARS and open_at is not None:
+            out.append((e["_t"] - open_at).total_seconds() / 60)
+            open_at = None
+    return out
+
+
+def summarise(rows):
+    by_user = {}
+    for e in rows:
+        by_user.setdefault(e.get("user", "?"), []).append(e)
+    users = {}
+    for u, ev in sorted(by_user.items()):
+        w = waits(ev)
+        users[u] = {
+            "prompts": sum(1 for e in ev if e["event"] == "prompt"),
+            "sessions": len({e.get("session") for e in ev if e.get("session")}),
+            "tool_calls": sum(1 for e in ev if e["event"] == "tool"),
+            "prs_created": sorted({e["pr_url"] for e in ev if e.get("pr_url")}),
+            "guard_denies": sum(1 for e in ev if e["event"] == "guard" and e.get("decision") == "deny"),
+            "guard_asks": sum(1 for e in ev if e["event"] == "guard" and e.get("decision") == "ask"),
+            "nudges": sum(1 for e in ev if e["event"] == "nudge"),
+            "idle_waits": len(w),
+            "idle_wait_avg_min": round(sum(w) / len(w), 1) if w else 0,
+            "idle_wait_max_min": round(max(w), 1) if w else 0,
+        }
+    all_w = [m for ev in by_user.values() for m in waits(ev)]
+    total = {
+        "users_with_activity": len(users),
+        "active_users": sum(1 for v in users.values() if v["prompts"] > 0),
+        "sessions": sum(v["sessions"] for v in users.values()),
+        "prompts": sum(v["prompts"] for v in users.values()),
+        "tool_calls": sum(v["tool_calls"] for v in users.values()),
+        "prs_created": sum(len(v["prs_created"]) for v in users.values()),
+        "guard_denies": sum(v["guard_denies"] for v in users.values()),
+        "guard_asks": sum(v["guard_asks"] for v in users.values()),
+        "nudges": sum(v["nudges"] for v in users.values()),
+        "idle_waits": len(all_w),
+        "idle_wait_avg_min": round(sum(all_w) / len(all_w), 1) if all_w else 0,
+        "idle_wait_max_min": round(max(all_w), 1) if all_w else 0,
+    }
+    return {"total": total, "users": users}
+
+
+def _increase(values):
+    """How much a counter went up over consecutive samples; a drop is a restart, counted from zero."""
+    total, prev = 0, None
+    for v in values:
+        if v is None:
+            continue
+        if prev is not None:
+            total += v - prev if v >= prev else v
+        prev = v
+    return total
+
+
+def load_samples(path, start, end):
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    t = parse_ts(e["ts"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if start <= t < end and isinstance(e.get("box"), dict):
+                    e["_t"] = t
+                    out.append(e)
+    except OSError:
+        return None
+    out.sort(key=lambda e: e["_t"])
+    return out
+
+
+def summarise_load(samples):
+    days = {}
+    for e in samples:
+        days.setdefault(e["_t"].strftime("%Y-%m-%d"), []).append(e)
+    out = {}
+    for day, ss in sorted(days.items()):
+        ppl = sorted({u for e in ss for u in (e.get("people") or {})})
+        mems = [e["box"].get("mem_available_mb") for e in ss if e["box"].get("mem_available_mb") is not None]
+        people = {}
+        for u in ppl:
+            rows = [(e.get("people") or {}).get(u) or {} for e in ss]
+            peaks = [r.get("mem_peak_mb") or r.get("mem_mb") for r in rows if (r.get("mem_peak_mb") or r.get("mem_mb"))]
+            people[u] = {"peak_sessions": max((r.get("active_sessions") or 0) for r in rows),
+                         "peak_mem_mb": max(peaks) if peaks else None,
+                         "high_events": _increase([r.get("high_events") for r in rows]),
+                         "max_events": _increase([r.get("max_events") for r in rows])}
+        out[day] = {"samples": len(ss),
+                    "box_peak_sessions": max(sum((p or {}).get("active_sessions") or 0 for p in (e.get("people") or {}).values())
+                                             for e in ss),
+                    "min_mem_available_mb": min(mems) if mems else None,
+                    "oom_kills": _increase([e["box"].get("oom_kills") for e in ss]),
+                    "people": people}
+    return {"days": out}
+
+
+def load_text(load):
+    if not load or not load.get("days"):
+        return ["Load: no samples yet"]
+    lines = ["Load (claude-agent-monitor, every 5 min)"]
+    for day, d in load["days"].items():
+        low = "%.1f GB" % (d["min_mem_available_mb"] / 1024) if d["min_mem_available_mb"] is not None else "?"
+        lines.append("  %s  box peak sessions %d, lowest memory %s, OOM kills %d  (%d samples)"
+                     % (day, d["box_peak_sessions"], low, d["oom_kills"], d["samples"]))
+        for u, p in d["people"].items():
+            mem = "%.1f GB" % (p["peak_mem_mb"] / 1024) if p["peak_mem_mb"] else "?"
+            lines.append("    %-12s peak sessions %d, peak memory %s, high %d, max %d"
+                         % (u, p["peak_sessions"], mem, p["high_events"], p["max_events"]))
+    return lines
+
+
+def text(rep, start, end):
+    t = rep["total"]
+    lines = [
+        "Claude agent usage  %s -> %s (UTC)" % (start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M")),
+        "",
+        "Active users (sent a prompt): %d   (users with any activity: %d)" % (t["active_users"], t["users_with_activity"]),
+        "Sessions: %d   Prompts: %d   Tool calls: %d" % (t["sessions"], t["prompts"], t["tool_calls"]),
+        "Draft PRs created: %d" % t["prs_created"],
+        "Guard: %d denied, %d asked" % (t["guard_denies"], t["guard_asks"]),
+        "Nudges sent: %d" % t["nudges"],
+        "Idle waits: %d (avg %.1f min, max %.1f min)" % (t["idle_waits"], t["idle_wait_avg_min"], t["idle_wait_max_min"]),
+        "",
+        "%-14s %7s %8s %6s %4s %5s %6s %7s %6s" % ("user", "prompts", "sessions", "tools", "PRs", "deny", "asks", "nudges", "waits"),
+    ]
+    for u, v in rep["users"].items():
+        lines.append("%-14s %7d %8d %6d %4d %5d %6d %7d %6d" % (
+            u, v["prompts"], v["sessions"], v["tool_calls"], len(v["prs_created"]),
+            v["guard_denies"], v["guard_asks"], v["nudges"], v["idle_waits"]))
+    prs = [(u, p) for u, v in rep["users"].items() for p in v["prs_created"]]
+    if prs:
+        lines += ["", "PRs:"] + ["  %-12s %s" % x for x in prs]
+    lines += [""] + load_text(rep.get("load"))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", default="/var/log/claude-agent")
+    ap.add_argument("--days", type=float, default=1)
+    ap.add_argument("--date")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--load-file", default=LOAD_FILE)
+    a = ap.parse_args(argv)
+    if a.date:
+        start = datetime.strptime(a.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+    else:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=a.days)
+    rep = summarise(load(a.dir, start, end))
+    samples = load_samples(a.load_file, start, end)
+    rep["load"] = summarise_load(samples) if samples else {}
+    if a.json:
+        print(json.dumps({"from": start.isoformat(), "to": end.isoformat(), **rep}, indent=2))
+    else:
+        print(text(rep, start, end))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

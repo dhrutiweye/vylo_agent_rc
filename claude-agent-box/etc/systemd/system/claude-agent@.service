@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude Code Remote Control agent for %i (tmux session "agent")
+After=network-online.target docker.service
+Wants=network-online.target
+
+# Instance name = Linux user = person (add-colleague.sh creates the user). Enabled by the Chat bridge
+# once that person has signed in to Claude; before that the loop would only fail to authenticate.
+[Service]
+Type=oneshot
+# All agents and scheduled jobs share claudeagents.slice (12 GB together); limits.conf caps each person.
+Slice=claudeagents.slice
+RemainAfterExit=yes
+User=%i
+WorkingDirectory=/home/%i/Documents/code/vylo
+Environment=HOME=/home/%i
+Environment=TERM=xterm-256color
+Environment=AGENT_NAME=%i-agent
+ExecStart=/usr/local/bin/agent-start
+ExecStop=-/usr/bin/tmux kill-session -t agent
+# Anything the agent started (a `docker compose up`, `docker logs -f`) gets SIGTERM, then SIGKILL after 20 s. At the
+# 90 s default a docker client that ignored SIGTERM held a stop past the bridge's wait, and the agent stayed down.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

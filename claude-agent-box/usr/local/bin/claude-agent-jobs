@@ -1,0 +1,99 @@
+#!/usr/bin/python3 -I
+"""Scheduled-jobs runner (root service, claude-agent-jobs.service). Every 30 s it reads each active colleague's
+~/.claude/jobs.json, and for whatever is due either posts the reminder (notify-me as that user) or starts the task
+(agent-job-exec as that user) in its own transient systemd unit with memory, CPU and run-time caps. All limits are
+enforced here, from /etc/claude-code/agent-jobs.env; see agent_jobs.py.
+"""
+import json
+import logging
+import os
+import pwd
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/usr/local/lib/claude-agent")
+import agent_jobs as aj  # noqa: E402
+import agent_outbox  # noqa: E402
+
+log = logging.getLogger("claude-agent-jobs")
+PEOPLE = os.environ.get("PEOPLE_FILE", "/etc/claude-agent/people.json")
+UNIT_PREFIX = "claude-job-"
+
+
+class SystemHost:
+    def people(self):
+        try:
+            with open(PEOPLE) as f:
+                return json.load(f).get("people", [])
+        except (OSError, ValueError):
+            return []
+
+    def agent_active(self, user):
+        return subprocess.run(["systemctl", "is-active", "--quiet", "claude-agent@%s.service" % user]).returncode == 0
+
+    def _pw(self, user):
+        return pwd.getpwnam(user)
+
+    def gid(self, user):
+        return self._pw(user).pw_gid
+
+    def read_jobs(self, user):
+        pw = self._pw(user)
+        return agent_outbox.read_home_file(pw.pw_dir, aj.JOBS_FILE, pw.pw_uid)
+
+    def notify(self, user, text, source):
+        home = self._pw(user).pw_dir
+        r = subprocess.run(["runuser", "-u", user, "--", "env", "HOME=" + home, "/usr/local/bin/notify-me", "--source", source],
+                           input=text, capture_output=True, text=True, timeout=30, cwd="/")
+        if r.returncode != 0:
+            log.warning("could not queue a message for %s: %s", user, r.stderr.strip()[:200])
+
+    def launch(self, user, job, limits):
+        home = self._pw(user).pw_dir
+        unit = "%s%s.%s.%d" % (UNIT_PREFIX, user, job["name"], int(time.time()))
+        cmd = ["systemd-run", "--wait", "--collect", "--quiet", "--unit", unit, "--uid", user, "--gid", user, "--slice", "claudeagents.slice",
+               "--working-directory", home,
+               "-p", "MemoryMax=" + limits.memory_max, "-p", "CPUQuota=" + limits.cpu_quota,
+               "-p", "RuntimeMaxSec=%d" % (limits.timeout + 60), "-p", "Nice=10", "-p", "IOWeight=50",
+               "--setenv", "HOME=" + home, "--setenv", "USER=" + user, "--setenv", "TERM=dumb",
+               "--setenv", "PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin" % home,
+               "/usr/local/bin/agent-job-exec", job["name"]]
+        log.info("starting task %s for %s", job["name"], user)
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/")
+
+    def running_units(self):
+        """Task units still running, also ones started before this service restarted: [(user, name)]."""
+        r = subprocess.run(["systemctl", "list-units", "--type=service", "--state=active,activating", "--no-legend",
+                            "--plain", UNIT_PREFIX + "*"], capture_output=True, text=True)
+        out = []
+        for line in r.stdout.splitlines():
+            unit = line.split()[0] if line.split() else ""
+            parts = unit[len(UNIT_PREFIX):].rsplit(".service", 1)[0].split(".")
+            if unit.startswith(UNIT_PREFIX) and len(parts) == 3:
+                out.append((parts[0], parts[1]))
+        return out
+
+
+def main():
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    limits = aj.load_limits()
+    runner = aj.Runner(SystemHost(), limits)
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    log.info("jobs runner started: %d jobs/person, tasks every >= %d min, %d task runs/day, %d at once on the box",
+             limits.max_jobs, limits.min_task // 60, limits.daily_cap, limits.concurrent)
+    while not stop.is_set():
+        try:
+            runner.tick()
+        except Exception:                                  # noqa: BLE001 - keep the loop alive
+            log.exception("tick failed")
+        stop.wait(30)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

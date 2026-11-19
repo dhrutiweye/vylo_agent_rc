@@ -1,0 +1,32 @@
+#!/usr/bin/python3 -I
+"""Print how many Claude sessions this person's agent may serve at once (1..5).
+
+  agent-max-sessions            for the calling user
+  agent-max-sessions NAME       for NAME (root, or anyone: the answer is not secret)
+
+Set by the admin in /etc/claude-code/agent-sessions.conf, and forced to 1 when the person's org policy makes Claude
+skip the box's managed settings (see agent_sessions.py). Any error prints 1.
+"""
+import os
+import pwd
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "claude-agent"))
+import agent_sessions  # noqa: E402
+
+
+def main(argv):
+    try:
+        pw = pwd.getpwnam(argv[1]) if len(argv) > 1 else pwd.getpwuid(os.getuid())
+        conf, home = agent_sessions.cli_inputs(os.environ, __file__, pw.pw_dir)
+        if len(argv) > 1:
+            home = pw.pw_dir
+        n = agent_sessions.effective_max(pw.pw_name, home, pw.pw_uid, conf)
+    except Exception:  # noqa: BLE001 — never block an agent from starting; 1 is today's behaviour
+        n = 1
+    print(n)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

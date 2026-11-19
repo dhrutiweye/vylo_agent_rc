@@ -1,0 +1,82 @@
+#!/usr/bin/python3 -I
+"""Run ONE scheduled task for this user and report to their Chat DM. Started by claude-agent-jobs (root) inside its
+own capped systemd unit, as the colleague; not meant to be run by hand.
+
+    agent-job-exec NAME
+
+Runs a fresh headless `claude -p` in the vylo folder with the job's prompt. CLAUDE_AGENT_JOB=NAME is set, which makes
+the guard refuse (instead of asking about) anything that would need approval, and tags the audit log rows so they
+are not mistaken for the interactive agent. The full output is kept in ~/.claude/job-results/NAME.txt.
+Exit code 0 = the task ran, anything else = failed (the runner pauses a job after repeated failures).
+"""
+import os
+import pwd
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/local/lib/claude-agent")
+import agent_jobs as aj  # noqa: E402
+import agent_outbox  # noqa: E402
+
+HOME = os.path.expanduser("~")
+WORKDIR = os.environ.get("AGENT_WORKDIR", os.path.join(HOME, "Documents", "code", "vylo"))
+PREAMBLE = (
+    "You are running as the scheduled job '{name}' for {user}. Nobody is watching this run and nobody can answer "
+    "questions or approve anything: do not wait for input. Anything that needs approval will be refused; when that "
+    "happens, or when the user must do something themselves (deploy, approve, message someone), say so in your final "
+    "answer on a line starting with 'NEEDS YOU:'. Your final answer is sent to the user in Google Chat, so keep it "
+    "short (under 1200 characters) and lead with what matters."
+)
+CHAT_CHARS = 1500
+
+
+def say(name, text):
+    try:
+        agent_outbox.write(HOME, text, "job:" + name)
+    except (ValueError, OSError) as e:
+        print("could not queue the Chat message: %s" % e, file=sys.stderr)
+
+
+def main(argv):
+    if len(argv) != 1 or not aj.NAME_RE.match(argv[0]):
+        print("usage: agent-job-exec NAME", file=sys.stderr)
+        return 64
+    name, limits = argv[0], aj.load_limits()
+    try:
+        job = next(j for j in aj.JobStore(HOME).read()["jobs"] if j.get("name") == name)
+    except StopIteration:
+        print("no job %s" % name, file=sys.stderr)
+        return 1
+    if job.get("kind") != "task" or not aj.valid_job(job, limits):
+        print("job %s is not a valid task" % name, file=sys.stderr)
+        return 1
+    env = dict(os.environ, CLAUDE_AGENT_JOB=name)
+    cmd = ["claude", "-p", job["prompt"], "--max-turns", str(limits.max_turns), "--output-format", "text",
+           "--append-system-prompt", PREAMBLE.format(name=name, user=pwd.getpwuid(os.getuid()).pw_name)]
+    try:
+        r = subprocess.run(cmd, cwd=WORKDIR if os.path.isdir(WORKDIR) else HOME, env=env, capture_output=True, text=True,
+                           timeout=max(60, limits.timeout - 30))
+        out, rc = (r.stdout or "").strip(), r.returncode
+        err = (r.stderr or "").strip()
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "").strip() if isinstance(e.stdout, str) else ""
+        rc, err = 124, "stopped after %d minutes" % (limits.timeout // 60)
+    except OSError as e:
+        out, rc, err = "", 127, str(e)
+    d = os.path.join(HOME, aj.RESULTS_DIR)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    with open(os.path.join(d, name + ".txt"), "w") as f:
+        f.write(out + ("\n\n[stderr]\n" + err if err else "") + "\n")
+    os.chmod(os.path.join(d, name + ".txt"), 0o600)
+    if rc == 0 and out:
+        text = out if len(out) <= CHAT_CHARS else out[:CHAT_CHARS].rstrip() + "\n... (full result: ask your agent for `agent-job show %s`)" % name
+        say(name, text)
+    elif rc == 0:
+        say(name, "ran, nothing to report")
+    else:
+        say(name, "failed (%s). Details: ask your agent for `agent-job show %s`." % ((err or out or "exit %d" % rc).splitlines()[-1][:200], name))
+    return 0 if rc == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,20 @@
+[Unit]
+Description=Vylo Agent Chat bridge (Google Chat <-> claude-agent onboarding and nudges)
+After=network-online.target
+Wants=network-online.target
+# Not enabled by install-box.sh: fill /etc/claude-agent/bridge.env and put the service-account key in
+# place first, then:  sudo systemctl enable --now claude-agent-bridge
+
+[Service]
+Type=simple
+# Root: it runs the Claude sign-in as each colleague's user (runuser) and enables claude-agent@<name>.
+User=root
+EnvironmentFile=/etc/claude-agent/bridge.env
+ExecStart=/usr/local/lib/claude-agent/venv/bin/python /usr/local/lib/claude-agent/chat_bridge.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=false
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Revive the claude-agent tmux session if it died
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet claude-agent.service
+ExecStart=/bin/sh -c 'runuser -u ubuntu -- tmux has-session -t agent 2>/dev/null || systemctl restart claude-agent.service'

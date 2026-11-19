@@ -1,0 +1,6 @@
+[Unit]
+Description=Revive claude-agent@<name> tmux sessions that died
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-agent-watch-all

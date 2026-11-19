@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the shared vylo repo mirrors from GitHub
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/claude-agent/gh-hosts.yml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vylo-mirror-sync.sh

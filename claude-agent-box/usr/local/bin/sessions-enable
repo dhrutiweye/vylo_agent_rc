@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Let one person's agent serve several Claude sessions, or put it back to one. Admin only (root).
+#
+#   sudo sessions-enable NAME [N]        N = 1..5, default 5: check, write NAME=N, restart their agent
+#   sudo sessions-enable --off NAME      remove NAME's line (back to the default), restart their agent
+#   --yes          do not ask before restarting (the restart ends the session they have open)
+#   --no-restart   only change the file; the agent picks it up on its next start
+#
+# Turning someone up is refused unless:
+#   - every base copy in their vylo folder (a direct child whose .git is a directory) has no uncommitted or
+#     untracked files and is on its default branch. With several sessions those copies are shared and the guard
+#     stops changes there, so work left in one would be stuck. Nothing in the repos is changed: they move it
+#     to a worktree or commit it themselves, then you run this again;
+#   - their Claude org policy (~/.claude/remote-settings.json), if any, sets "managedSourcesBehavior": "merge".
+#     Without it Claude skips the box's own settings for them, guard included (agent-max-sessions would hold
+#     them at 1 anyway).
+# The file is /etc/claude-code/agent-sessions.conf, changed under a lock so two runs cannot lose a line.
+# Tests only: AGENT_SESSIONS_CONF, VYLO_HOME_ROOT (default /home), SESSIONS_LOCK, SESSIONS_NO_SYSTEMCTL=1 (no
+# systemctl, no runuser, no root needed).
+set -uo pipefail
+CONF=${AGENT_SESSIONS_CONF:-/etc/claude-code/agent-sessions.conf}
+HOMES=${VYLO_HOME_ROOT:-/home}
+LOCK=${SESSIONS_LOCK:-/etc/claude-agent/sessions.lock}
+TEST=${SESSIONS_NO_SYSTEMCTL:-}
+
+die() { echo "sessions-enable: $*" >&2; exit 2; }
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+yes="" restart=1 off="" args=()
+for a in "$@"; do
+  case "$a" in
+    --yes|-y) yes=1 ;;
+    --no-restart) restart="" ;;
+    --off) off=1 ;;
+    -h|--help) usage ;;
+    -*) die "unknown option $a" ;;
+    *) args+=("$a") ;;
+  esac
+done
+[ "${#args[@]}" -ge 1 ] && [ "${#args[@]}" -le 2 ] || usage
+NAME=${args[0]}; N=${args[1]:-5}
+[[ $NAME =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "not a user name: $NAME"
+[ -n "$off" ] && [ "${#args[@]}" = 2 ] && die "--off takes only a name"
+[[ $N =~ ^[1-5]$ ]] || die "N must be 1..5, not $N"
+[ -n "$TEST" ] || [ "$EUID" = 0 ] || die "run it as root (sudo)"
+HOME_DIR=$HOMES/$NAME
+[ -d "$HOME_DIR" ] || die "no home for $NAME at $HOME_DIR"
+
+as_person() {  # run a read-only command as the person (plain, in tests)
+  if [ -n "$TEST" ]; then "$@"; else runuser -u "$NAME" -- "$@"; fi
+}
+
+check() {  # prints one line per problem; returns 1 if any
+  local bad=0 d r def cur dirty policy
+  local vylo=$HOME_DIR/Documents/code/vylo
+  for d in "$vylo"/*/; do
+    d=${d%/}; r=$(basename "$d")
+    [ -d "$d/.git" ] || continue                     # not a repo, or a worktree (.git is a file)
+    if ! as_person test -r "$d/.git"; then
+      echo "  $r: skipped ($NAME cannot read it, so their agent cannot change it)"; continue
+    fi
+    if ! dirty=$(as_person git -C "$d" status --porcelain 2>&1); then
+      echo "  $r: could not check it: $(head -1 <<<"$dirty")"; bad=1; continue
+    fi
+    if [ -n "$dirty" ]; then
+      echo "  $r: has uncommitted or untracked files ($(wc -l <<<"$dirty" | tr -d ' ') paths)"; bad=1
+    fi
+    def=$(as_person git -C "$d" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null) && def=${def#origin/} \
+      || { if as_person git -C "$d" show-ref -q --verify refs/heads/master; then def=master; else def=main; fi; }
+    cur=$(as_person git -C "$d" symbolic-ref --short -q HEAD 2>/dev/null || echo "a detached HEAD")
+    if [ "$cur" != "$def" ]; then
+      echo "  $r: is on $cur, not $def"; bad=1
+    fi
+  done
+  if as_person test -e "$HOME_DIR/.claude/remote-settings.json"; then
+    policy=$(as_person cat "$HOME_DIR/.claude/remote-settings.json" 2>/dev/null)
+    if ! python3 -I -c 'import json,sys
+try: p = json.loads(sys.stdin.read())
+except ValueError: sys.exit(1)
+sys.exit(0 if isinstance(p, dict) and p.get("managedSourcesBehavior") == "merge" else 1)' <<<"$policy"; then
+      echo "  their Claude org pushes a policy without \"managedSourcesBehavior\": \"merge\", so Claude would skip the box's"
+      echo "  guard for them. The org policy must allow merging first (a claude.ai Owner adds it to the org's"
+      echo "  managed settings; for WheelsEye accounts that is the WheelsEye org)."
+      bad=1
+    fi
+  fi
+  return $bad
+}
+
+write_conf() {  # $1 = the new line, or empty to only remove NAME's
+  local tmp
+  mkdir -p "$(dirname "$LOCK")" 2>/dev/null
+  exec 9>"$LOCK" || die "cannot open the lock $LOCK"
+  flock -w 30 9 || die "another sessions-enable is running"
+  tmp=$(mktemp "$CONF.XXXXXX") || die "cannot write next to $CONF"
+  { [ -f "$CONF" ] && grep -v "^[[:space:]]*$NAME[[:space:]]*=" "$CONF"; [ -n "$1" ] && echo "$1"; } >"$tmp"
+  chmod 644 "$tmp" && mv -f "$tmp" "$CONF" || { rm -f "$tmp"; die "could not update $CONF"; }
+  exec 9>&-
+}
+
+if [ -z "$off" ]; then
+  if ! problems=$(check); then
+    echo "Not changed: $NAME cannot have several sessions yet."
+    echo "$problems"
+    echo "Ask $NAME to commit or move that work to a worktree (their agent can do it), then run this again."
+    exit 1
+  fi
+  [ -n "$problems" ] && echo "$problems"
+fi
+
+if [ -n "$restart" ] && [ -z "$yes" ] && [ -z "$TEST" ]; then
+  read -r -p "This restarts $NAME's agent and ends the session they have open. Go on? [y/N] " ans
+  [[ $ans =~ ^[Yy] ]] || { echo "Nothing changed."; exit 1; }
+fi
+
+if [ -n "$off" ]; then
+  write_conf ""
+  d=$(grep -E '^[[:space:]]*default[[:space:]]*=' "$CONF" | tail -1)
+  echo "$NAME is back to the default (${d:-default=1})."
+else
+  write_conf "$NAME=$N"
+  echo "$NAME may now have $N sessions."
+fi
+
+if [ -n "$restart" ] && [ -z "$TEST" ]; then
+  systemctl restart "claude-agent@$NAME.service" && echo "Restarted $NAME's agent." \
+    || echo "Could not restart claude-agent@$NAME; it picks the change up on its next start."
+fi
+exit 0
