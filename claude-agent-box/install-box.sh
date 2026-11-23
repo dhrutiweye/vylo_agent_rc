@@ -27,7 +27,7 @@ put() {  # put <mode> <relative path in bundle>   (destination = / + relative pa
 # scripts first, the policy files (what the live agent reads) last
 for f in agent-start agent-run claude-agent-watch-all claude-audit.sh claude-agent-report add-colleague.sh \
          remove-colleague.sh vylo-mirror-refresh.sh vylo-mirror-sync.sh gh-token-check.sh set-gh-token.sh jira-token-check.sh set-jira-token.sh claude-agent-seed-template.sh \
-         notify-me agent-job agent-job-exec claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor; do put 755 "usr/local/bin/$f"; done
+         notify-me agent-job agent-job-exec claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor lock-box-rules; do put 755 "usr/local/bin/$f"; done
 put 644 usr/local/lib/claude-agent/chat_bridge.py
 put 644 usr/local/lib/claude-agent/agent_outbox.py
 put 644 usr/local/lib/claude-agent/agent_jobs.py
@@ -43,6 +43,7 @@ put 644 etc/claude-agent/bridge.env.example
 install -d -m 711 /var/lib/claude-agent-jobs     # runner state, one file per colleague (readable by that colleague)
 put 755 usr/local/bin/claude-guard.sh
 put 644 etc/claude-code/managed-settings.json
+/usr/local/bin/lock-box-rules --refresh-all || true   # org-plan colleagues' locked copies of the box rules follow it
 if [ ! -f /etc/claude-code/agent-jobs.env ]; then put 644 etc/claude-code/agent-jobs.env; fi   # job limits: kept if you changed them
 # sessions per person: never overwritten (sessions-enable edits it); readable by agents, the guard and agent-run
 if [ ! -f /etc/claude-code/agent-sessions.conf ]; then install -D -m 644 -o root -g root "$HERE/etc/claude-code/agent-sessions.conf" /etc/claude-code/agent-sessions.conf; fi

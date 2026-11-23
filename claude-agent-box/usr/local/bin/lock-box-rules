@@ -1,0 +1,191 @@
+#!/usr/bin/python3 -I
+"""Lock the box's rules into a person's own Claude settings. Admin only (root).
+
+  sudo lock-box-rules NAME...          write ~/.claude/settings.json for each, owned by root and immutable
+  sudo lock-box-rules --refresh-all    rewrite every copy this tool made (install-box.sh runs it after an update)
+  sudo lock-box-rules --check NAME     say whether NAME's rules are locked
+  sudo lock-box-rules --unlock NAME    remove the copy (never a file the person made)
+
+Why: a colleague signed in with an org plan whose policy lacks "managedSourcesBehavior": "merge" gets the org's
+managed settings only; Claude skips /etc/claude-code/managed-settings.json, guard and audit hooks included. Claude still
+runs hooks from the person's own settings, so the same env, hooks and permissions are written there, owned by root and
+marked immutable so neither the person nor their agent can change, move or delete it. Their running agent picks it up
+when it restarts. agent-max-sessions then lets them have several sessions (see agent_sessions.box_rules_locked).
+
+A person who already has a settings.json of their own is refused: merge it by hand. Nothing is ever written through a
+symbolic link: the home and ~/.claude are opened one step at a time, each owned by the person.
+Tests only (ignored by the installed copy): VYLO_HOME_ROOT, MANAGED_SETTINGS, LOCK_NO_IMMUTABLE=1.
+"""
+import array
+import fcntl
+import json
+import os
+import pwd
+import stat
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "claude-agent"))
+import agent_outbox  # noqa: E402
+import agent_sessions  # noqa: E402
+
+INSTALLED = "/usr/local/bin/lock-box-rules"
+TEST_COPY = os.path.realpath(__file__) != INSTALLED
+HOMES = os.environ.get("VYLO_HOME_ROOT", "/home") if TEST_COPY else "/home"
+MANAGED = os.environ.get("MANAGED_SETTINGS", "/etc/claude-code/managed-settings.json") if TEST_COPY \
+    else "/etc/claude-code/managed-settings.json"
+NO_IMMUTABLE = TEST_COPY and os.environ.get("LOCK_NO_IMMUTABLE") == "1"
+FS_IOC_SETFLAGS = 0x40086602
+NAME = agent_sessions.USER_RULES
+KEYS = ("env", "hooks", "permissions")
+
+
+class Refused(Exception):
+    pass
+
+
+def _set_immutable(fd, on):
+    if NO_IMMUTABLE:
+        return
+    buf = array.array("l", [0])
+    fcntl.ioctl(fd, agent_sessions.FS_IOC_GETFLAGS, buf, True)
+    buf[0] = (buf[0] | agent_sessions.FS_IMMUTABLE_FL) if on else (buf[0] & ~agent_sessions.FS_IMMUTABLE_FL)
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, buf)
+
+
+def rules_text():
+    with open(MANAGED) as f:
+        managed = json.load(f)
+    return json.dumps({k: managed[k] for k in KEYS if k in managed}, indent=2) + "\n"
+
+
+def _person(name):
+    if not name or "/" in name:
+        raise Refused("not a user name: %r" % name)
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        raise Refused("no such user: %s" % name)
+    return pw, os.path.join(HOMES, name)
+
+
+def _claude_dir(home, uid):
+    try:
+        return agent_outbox.open_user_dir(home, ".claude", uid)
+    except OSError as e:
+        raise Refused("%s/.claude is missing, not theirs, or a link (%s): has this person signed in?" % (home, e))
+
+
+def _ours(dfd):
+    """True if settings.json there was written by this tool (root-owned), False if absent. Refused if it is theirs."""
+    try:
+        st = os.stat(NAME, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISREG(st.st_mode) and st.st_uid == 0:
+        return True
+    raise Refused("has their own settings.json; merge the box's rules into it by hand")
+
+
+def lock(name, text):
+    pw, home = _person(name)
+    dfd = _claude_dir(home, pw.pw_uid)
+    try:
+        if _ours(dfd):
+            fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            try:
+                _set_immutable(fd, False)
+            finally:
+                os.close(fd)
+        tmp = "." + NAME + ".box-tmp"
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            os.write(fd, text.encode())
+            os.fchmod(fd, 0o644)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+        fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            _set_immutable(fd, True)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+def unlock(name):
+    pw, home = _person(name)
+    dfd = _claude_dir(home, pw.pw_uid)
+    try:
+        if not _ours(dfd):
+            raise Refused("has no locked rules")
+        fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            _set_immutable(fd, False)
+        finally:
+            os.close(fd)
+        os.unlink(NAME, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+
+
+def ours_everywhere():
+    out = []
+    for name in sorted(os.listdir(HOMES)):
+        try:
+            pw, home = _person(name)
+            dfd = _claude_dir(home, pw.pw_uid)
+        except Refused:
+            continue
+        try:
+            if _ours(dfd):
+                out.append(name)
+        except Refused:
+            pass
+        finally:
+            os.close(dfd)
+    return out
+
+
+def main(argv):
+    if not TEST_COPY and os.geteuid() != 0:
+        print("run it as root (sudo)", file=sys.stderr)
+        return 2
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.split("\n\n")[1])
+        return 2
+    try:
+        if argv[0] == "--check":
+            for name in argv[1:]:
+                pw, home = _person(name)
+                print("%s: %s" % (name, "locked" if agent_sessions.box_rules_locked(home, pw.pw_uid) else "NOT locked"))
+            return 0
+        if argv[0] == "--unlock":
+            for name in argv[1:]:
+                unlock(name)
+                print("%s: removed; their agent drops the box's rules when it restarts" % name)
+            return 0
+        names = ours_everywhere() if argv[0] == "--refresh-all" else argv
+        text, bad = rules_text(), 0
+        for name in names:
+            try:
+                lock(name, text)
+                print("%s: box rules locked into ~/.claude/settings.json (their agent picks them up when it restarts)" % name)
+            except (Refused, OSError) as e:
+                print("%s: not changed: %s" % (name, e), file=sys.stderr)
+                bad = 1
+        if argv[0] == "--refresh-all" and not names:
+            print("no locked copies to refresh")
+        return bad
+    except Refused as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

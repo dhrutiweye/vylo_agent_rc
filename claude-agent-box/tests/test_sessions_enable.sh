@@ -45,6 +45,7 @@ setup; echo x >"$V/r1/new.txt"; before=$(cat "$AGENT_SESSIONS_CONF"); run --yes 
 setup; echo '{"permissions":{"disableBypassPermissionsMode":"disable"}}' >"$T/home/ann/.claude/remote-settings.json"
 before=$(cat "$AGENT_SESSIONS_CONF"); run --yes ann
 [ $rc = 1 ] && [[ $out == *"must allow merging"* ]]; ok $? "org policy without merge: refused ($out)"
+[[ $out == *"lock-box-rules ann"* ]]; ok $? "the refusal names the other way: lock-box-rules"
 [ "$(cat "$AGENT_SESSIONS_CONF")" = "$before" ]; ok $? "org policy: conf unchanged"
 echo '{"managedSourcesBehavior":"merge"}' >"$T/home/ann/.claude/remote-settings.json"; run --yes ann
 [ $rc = 0 ]; ok $? "org policy with merge: allowed ($out)"

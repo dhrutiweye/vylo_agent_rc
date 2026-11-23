@@ -11,8 +11,9 @@
 #     untracked files and is on its default branch. With several sessions those copies are shared and the guard
 #     stops changes there, so work left in one would be stuck. Nothing in the repos is changed: they move it
 #     to a worktree or commit it themselves, then you run this again;
-#   - their Claude org policy (~/.claude/remote-settings.json), if any, sets "managedSourcesBehavior": "merge".
-#     Without it Claude skips the box's own settings for them, guard included (agent-max-sessions would hold
+#   - the box's guard runs for them: no Claude org policy (~/.claude/remote-settings.json), or one that sets
+#     "managedSourcesBehavior": "merge", or the box's rules locked into their own settings (sudo lock-box-rules
+#     NAME). Otherwise Claude skips the box's settings for them, guard included (agent-max-sessions would hold
 #     them at 1 anyway).
 # The file is /etc/claude-code/agent-sessions.conf, changed under a lock so two runs cannot lose a line.
 # Tests only: AGENT_SESSIONS_CONF, VYLO_HOME_ROOT (default /home), SESSIONS_LOCK, SESSIONS_NO_SYSTEMCTL=1 (no
@@ -72,17 +73,13 @@ check() {  # prints one line per problem; returns 1 if any
       echo "  $r: is on $cur, not $def"; bad=1
     fi
   done
-  if as_person test -e "$HOME_DIR/.claude/remote-settings.json"; then
-    policy=$(as_person cat "$HOME_DIR/.claude/remote-settings.json" 2>/dev/null)
-    if ! python3 -I -c 'import json,sys
-try: p = json.loads(sys.stdin.read())
-except ValueError: sys.exit(1)
-sys.exit(0 if isinstance(p, dict) and p.get("managedSourcesBehavior") == "merge" else 1)' <<<"$policy"; then
-      echo "  their Claude org pushes a policy without \"managedSourcesBehavior\": \"merge\", so Claude would skip the box's"
-      echo "  guard for them. The org policy must allow merging first (a claude.ai Owner adds it to the org's"
-      echo "  managed settings; for WheelsEye accounts that is the WheelsEye org)."
-      bad=1
-    fi
+  local lib; lib=$(dirname "$(realpath "$0")")/../lib/claude-agent
+  if ! python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import agent_sessions as s
+sys.exit(0 if s.org_policy_ok(sys.argv[2], int(sys.argv[3])) else 1)' "$lib" "$HOME_DIR" "$(stat -c %u "$HOME_DIR")"; then
+    echo "  their Claude org pushes a policy without \"managedSourcesBehavior\": \"merge\", so Claude skips the box's"
+    echo "  guard for them. Either the org policy must allow merging (a claude.ai Owner adds it to the org's managed"
+    echo "  settings), or lock the box's rules into their own settings first: sudo lock-box-rules $NAME"
+    bad=1
   fi
   return $bad
 }

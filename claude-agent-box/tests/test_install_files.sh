@@ -20,7 +20,8 @@ grep -qx 'Slice=claudeagents.slice' "$R/etc/systemd/system/claude-agent@.service
 echo "== installer"
 for f in usr/local/lib/claude-agent/agent_sessions.py usr/local/bin/agent-max-sessions usr/local/bin/sessions-enable \
          etc/systemd/system/claudeagents.slice usr/local/bin/claude-agent-monitor \
-         etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer; do
+         etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer \
+         usr/local/bin/lock-box-rules; do
   grep -q "$(basename "$f")" "$I"; ok $? "install-box.sh installs $f"
 done
 grep -q 'agent-sessions.conf' "$I"; ok $? "install-box.sh installs agent-sessions.conf"
@@ -28,6 +29,9 @@ grep -E 'agent-sessions\.conf' "$I" | grep -q '\[ ! -f /etc/claude-code/agent-se
 grep -E 'install .*agent-sessions\.conf' "$I" | grep -q -- '-m 644'; ok $? "agent-sessions.conf is mode 644"
 
 grep -q 'enable --now claude-agent-monitor.timer' "$I"; ok $? "install-box.sh starts the monitor timer"
+grep -q 'lock-box-rules --refresh-all' "$I"; ok $? "install-box.sh refreshes locked copies of the box rules"
+[ "$(grep -n 'lock-box-rules --refresh-all' "$I" | cut -d: -f1)" -gt "$(grep -n 'put 644 etc/claude-code/managed-settings.json' "$I" | cut -d: -f1)" ]
+ok $? "the refresh runs after the new managed-settings.json is in place"
 grep -qx 'OnUnitActiveSec=5min' "$R/etc/systemd/system/claude-agent-monitor.timer"; ok $? "monitor every 5 minutes"
 grep -q '^ADMIN_PERSON=' "$R/etc/claude-agent/bridge.env.example"; ok $? "bridge.env.example has ADMIN_PERSON"
 

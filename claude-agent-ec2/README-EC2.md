@@ -110,6 +110,12 @@ the Claude app. They get one session. The bot nudges them in Chat when the agent
   shared by all their sessions, so the guard refuses edits, commits and branch switches there: every change happens
   in a worktree (`vylo/.worktrees/<repo>-<branch>`). At most 2 helpers a session. Nudges and the busy check name the
   session that is waiting. `sudo sessions-enable --off <name>` puts them back to 1.
+- **Colleagues on an org plan.** If someone's Claude org pushes a policy without `"managedSourcesBehavior": "merge"`,
+  Claude skips `/etc/claude-code/managed-settings.json` for them: no guard, no audit log, no several sessions.
+  `sudo lock-box-rules <name>` copies the box's rules into their own `~/.claude/settings.json`, owned by root and
+  immutable, which Claude does run; their agent picks it up when it restarts. `install-box.sh` keeps those copies in
+  step with the box rules (`--refresh-all`); `--check` and `--unlock` do what they say. `verify-box.sh` warns for anyone
+  whose guard does not run. (If the org ever sets `allowManagedHooksOnly`, this stops working and they fall back to 1.)
 - **Box load.** `claude-agent-monitor.timer` samples memory, disk and each person's sessions every 5 minutes into
   `/var/log/claude-agent-load.jsonl`, and alerts `ADMIN_PERSON` (in `bridge.env`) in Chat as `[box]`: memory under
   1.5 GB twice in a row, disk under 10 GB, or an out-of-memory kill, each at most once an hour. All agents and jobs

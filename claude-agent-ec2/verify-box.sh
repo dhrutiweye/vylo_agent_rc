@@ -30,6 +30,14 @@ chk "managed settings are valid JSON" jq -e . /etc/claude-code/managed-settings.
 S=/etc/claude-code/agent-sessions.conf
 [ -f $S ] && [ "$(stat -c %a $S)" = 644 ] && [ "$(stat -c %U $S)" = root ] && ok "$S root-owned, 644" || bad "$S must exist, root-owned, mode 644"
 n=$(runuser -u nobody -- /usr/local/bin/agent-max-sessions 2>/dev/null); [[ $n =~ ^[1-5]$ ]] && ok "agent-max-sessions runs (nobody: $n)" || bad "agent-max-sessions does not run"
+for u in $(jq -r '.people[] | select(.status=="active") | .linux_user' /etc/claude-agent/people.json 2>/dev/null); do
+  if python3 -I -c 'import sys; sys.path.insert(0, "/usr/local/lib/claude-agent"); import agent_sessions as s, pwd
+p = pwd.getpwnam(sys.argv[1]); sys.exit(0 if s.org_policy_ok(p.pw_dir, p.pw_uid) else 1)' "$u" 2>/dev/null; then
+    ok "$u: the box's guard and audit hooks run"
+  else
+    warn "$u: the box's guard does NOT run (org policy without merge): sudo lock-box-rules $u"
+  fi
+done
 [ "$(systemctl show -p LoadState --value claudeagents.slice)" = loaded ] && ok "claudeagents.slice loaded" || bad "claudeagents.slice is not loaded (sudo systemctl daemon-reload)"
 cg=$(systemctl show -p ControlGroup --value claudeagents.slice 2>/dev/null)
 [ "$cg" = /claudeagents.slice ] && [ -f "/sys/fs/cgroup$cg/memory.events" ] && ok "the monitor's cgroup path exists ($cg)" \

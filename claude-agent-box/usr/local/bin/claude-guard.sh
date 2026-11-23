@@ -363,6 +363,25 @@ mcp_check() {
   local rest=${tool#mcp__} server name lname first second
   server=${rest%%__*}; name=${rest#*__}
 
+  # Claude's own session tools (Remote Control). Sessions are allowed: list, read, name, tag, archive, message and
+  # interrupt the person's own, and start one when their agent serves several (it then runs on the box, under this
+  # guard; with one session there is no room here, so a new one would run somewhere these rules do not reach).
+  # Scheduled cloud runs (triggers, send_later), environments, repos, watches and anything new stay refused, admins
+  # included: they start work that runs off the box. Scheduled work on the box is agent-job.
+  if [ "$server" = claude-code-remote ]; then
+    case "$name" in
+      create_session)
+        multi_session && return 0
+        decide deny "Your agent runs one session, so a new one cannot start on the box. Ask your user to say \"new session\" to the Vylo Agent bot in Google Chat (the current one is kept)." ;;
+      list_sessions|get_session|set_session_title|set_session_tags|archive_session|unarchive_session|send_message|interrupt_session|list_events|get_event)
+        return 0 ;;
+      *trigger*|send_later)
+        decide deny "Scheduled cloud runs are not allowed from the box: they run where its rules do not apply. Use agent-job for scheduled work." ;;
+      *)
+        decide deny "claude-code-remote/$name is not allowed from the box: only starting and managing your own sessions is." ;;
+    esac
+  fi
+
   # Per-user MCP allow-list. ${MCP_POLICY_DIR:-/etc/claude-code}/mcp-allow.txt lists substrings of the MCP servers agents may
   # use (jira, github); the users in ${MCP_POLICY_DIR:-/etc/claude-code}/mcp-all-users.txt (admins) are unrestricted. This also
   # covers the claude.ai connectors (Gmail, Drive, Calendar, Notion ...) that arrive with a colleague's OWN

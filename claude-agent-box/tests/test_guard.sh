@@ -94,7 +94,25 @@ t allow mcp__plugin_github_github__get_pull_request '{}'
 printf '%s\n' "$(id -un)" >"$PD/mcp-all-users.txt"
 echo "== admin user is unrestricted"
 t allow mcp__wheelseye-kubernetes-mcp__kubernetes_mcp-pods_list '{}'
+echo "== Claude's own session tools (claude-code-remote): sessions yes, scheduled cloud runs and environments no"
+R=mcp__claude-code-remote__
+export CLAUDE_GUARD_MAX_SESSIONS=5
+for x in create_session list_sessions get_session set_session_title set_session_tags archive_session unarchive_session \
+         send_message interrupt_session list_events get_event; do
+  t allow "$R$x" '{"title":"x"}'
+done
+for x in create_trigger update_trigger fire_trigger delete_trigger list_triggers send_later create_environment \
+         update_environment switch_environment add_repo register_repo_root confirm_repository_trust watch_url \
+         subscribe_pr_activity request_computer_folder report_preview_port some_new_tool; do
+  t deny "$R$x" '{}'
+done
+export CLAUDE_GUARD_MAX_SESSIONS=1
+t deny  "${R}create_session" '{"title":"x"}'; t allow "${R}list_sessions" '{}'
+out=$(jq -nc --arg t "${R}create_session" '{tool_name:$t,cwd:"/",session_id:"s",tool_input:{}}' | "$GUARD" | jq -r .hookSpecificOutput.permissionDecisionReason)
+if [[ $out == *"new session"* ]]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL one-session create_session reason: $out"; fi
+unset CLAUDE_GUARD_MAX_SESSIONS
 export MCP_POLICY_DIR=$ADMIN_PD; rm -rf "$PD"
+t deny  "${R}fire_trigger" '{}'                                      # admins too: no scheduled cloud runs
 
 echo "== MCP: prod systems are read-only (deny), Jira comments allowed, transitions/creates ask"
 t deny  mcp__wheelseye-jenkins-mcp__jenkins_build_job '{}'; t deny mcp__wheelseye-jenkins-mcp__trigger_build '{}'
