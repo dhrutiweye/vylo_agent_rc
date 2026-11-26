@@ -114,9 +114,20 @@ ASK_COPY = "Your agent answered %s's agent. Q: %s A: %s"
 ASK_DM = "%s answered your agent's question «%s»: %s"
 ASK_DECIDED = "That question is already decided."
 ASK_CLOSED = "That question is closed."
+ASK_CORRECTED = "Sent to %s as a correction."
+ASK_CORRECTION = "%s corrects their agent's answer: %s"
+ASK_ALREADY_DELIVERED = "That answer was already delivered to %s's agent, so this was not sent."
+ASK_COPY_QUESTION_CHARS = 300  # the question in the copy is cut: question + answer must fit one Chat message
+CANNOT_REASON_CHARS = 300      # the answer run's CANNOT_ANSWER reason, as the colleague's hand-over shows it
 DOIT_PROMPT = ("%s's agent asked you the question below, and %s told you to act on it (\"do it\").\n"
                "<<<QUESTION\n%s\nQUESTION>>>\n"
                "Do what it asks if it is reasonable and safe, then end with the answer to send back to %s's agent.")
+
+
+def defuse_markers(text):
+    """The text with every run of 3+ '<' or '>' cut to two, so nothing in it can open or close a <<<QUESTION ...
+    QUESTION>>> quote. One pass is enough: a cut run never joins its neighbours into a new one."""
+    return re.sub(r">{3,}", ">>", re.sub(r"<{3,}", "<<", text))
 
 
 def shown(name):
@@ -413,14 +424,19 @@ class Bridge:
             self.on_litellm_key(person, m["space"], text.strip())
             return
         if person["status"] == "active" and m["thread"]:
-            found = self.state.item_by_thread(user, m["thread"])
+            try:                                            # every DM has a thread: a state error must not stop the commands
+                found = self.state.item_by_thread(user, m["thread"])
+                closed = None if found else self._closed_ask_thread(user, m["thread"])
+            except Exception as e:                          # noqa: BLE001 - logged without the text, then the commands
+                log.warning("thread lookup failed for %s: %s", user, e.__class__.__name__)
+                found = closed = None
             if found and self._on_thread(person, m["space"], found, text):
                 self.pending.pop(user, None)
                 return
-            if not found and self._closed_ask_thread(user, m["thread"]):
-                self.pending.pop(user, None)                # a late yes/answer/"do it": never a command or a task
+            if closed:
+                self.pending.pop(user, None)                # a late yes/answer/"do it"/correction: never a command or a task
                 if text.strip():
-                    self._reply(m["space"], ASK_CLOSED, m["thread"])
+                    self._reply(m["space"], closed, m["thread"])
                 return
         if low in YES_WORDS:
             self.on_yes(person, m["space"])
@@ -899,12 +915,14 @@ class Bridge:
         """A yes/no in an ask's approval thread (the asker's person), or the colleague's answer / "do it" in the thread
         of an ask they received. Always True: a message in an ask's thread is never a command or a task."""
         user, ask_id = person["linux_user"], item["ask"]
-        thread = item.get("approval_thread" if role == "approval" else "received_thread") or ""
+        thread = item.get({"approval": "approval_thread", "copy": "copy_thread"}.get(role, "received_thread")) or ""
         if not thread.startswith(space + "/"):              # only the person's own DM space counts
             log.warning("ignored a message for ask %s from %s: not in their own DM", ask_id, user)
             return True
         if role == "approval":
             self._on_approval(space, ask_id, thread, text)
+        elif role == "copy":
+            self._on_copy(person, space, ask_id, thread, text)
         else:
             self._on_received(person, space, ask_id, thread, text)
         return True
@@ -996,7 +1014,11 @@ class Bridge:
             if other:
                 self._reply(space, "Still working on your last task (#%s)." % other["ref"][1:], thread)
                 return
+            if self.state.count_today("task", user) >= self.cfg.chat_tasks_per_day:   # a reply is a run too
+                self._reply(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day, thread)
+                return
             request = self._request(body, task["session_uuid"], resume=bool(task.get("launched")))
+            self.state.log_task_run(user)                  # accepted (started or queued): it counts for today
             if self.state.running() < self.cfg.chat_runs_at_once:
                 if self._launch(user, space, thread, ref, request):
                     self._reply(space, "On it.", thread)
@@ -1153,7 +1175,8 @@ class Bridge:
                     return
                 request = {"mode": "doit", "session_uuid": str(uuid.uuid4()), "resume": False, "ask": ask_id,
                            "asker": ask["from_name"], "prompt": DOIT_PROMPT % (
-                               shown(ask["from_name"]), shown(ask["to_name"]), ask["text"], shown(ask["from_name"]))}
+                               shown(ask["from_name"]), shown(ask["to_name"]), defuse_markers(ask["text"]),
+                               shown(ask["from_name"]))}
                 started = self._start_ask_run(ask_id, "d" + ask_id[1:], request)
                 if started:
                     self._audit_ask(ask, "do_it", len(ask["text"]))
@@ -1168,6 +1191,30 @@ class Bridge:
             self._audit_ask(ask, "answered", len(body))
             self._deliver(ask, "answered", body, by="person")
             self._reply(space, "Sent to %s." % shown(ask["from_name"]), thread)
+
+    def _on_copy(self, person, space, ask_id, thread, text):
+        """The colleague, in the thread of the copy of their agent's answer: their own answer, sent to the asker as a
+        correction while the ask is open (an asker who already read the first answer gets it in their DM)."""
+        user, body = person["linux_user"], (text or "").strip()
+        if not body:
+            return
+        with self.run_lock:
+            ask = self.state.get(ask_id)
+            if not ask or ask.get("closed_at") is not None:
+                self._reply(space, ASK_ALREADY_DELIVERED % shown((ask or {}).get("from_name") or "your colleague"),
+                            thread)
+                return
+            if len(body) > TASK_MAX_CHARS:
+                self._reply(space, TOO_LONG, thread)
+                return
+            if looks_secret(body):
+                log.info("refused a correction to ask %s from %s: it looks like a secret (where=answer)", ask_id, user)
+                self._audit(user, "secret_blocked", where="answer")
+                self._reply(space, SECRET_REFUSED, thread)
+                return
+            self._audit_ask(ask, "corrected", len(body))
+            self._deliver(ask, "answered", ASK_CORRECTION % (shown(ask["to_name"]), body), by="person")
+            self._reply(space, ASK_CORRECTED % shown(ask["from_name"]), thread)
 
     def _start_ask_run(self, ask_id, ref, request):
         """An ask's answer run (ref a…) or do-it run (d…) in the colleague's account. True started, "queued" waiting for
@@ -1302,7 +1349,10 @@ class Bridge:
         if ask.get("status") != "asking_agent" or ask.get("closed_at") is not None:
             return False
         if status != "answer":                             # cannot, failed or anything off-mode: the person decides
-            self._hand_to_person(ask["ask"])
+            note = ""
+            if status == "cannot" and (text or "").strip() and not looks_secret(text):
+                note = " (Your agent could not answer: %s)" % short_text(text, CANNOT_REASON_CHARS)
+            self._hand_to_person(ask["ask"], note)
             return True
         if looks_secret(text):
             log.info("did not send the answer to ask %s: it looks like a secret (where=answer)", ask["ask"])
@@ -1316,8 +1366,10 @@ class Bridge:
         colleague = self._person_of(ask["to"])
         if colleague and colleague.get("chat_space"):
             try:
-                self.chat.send(colleague["chat_space"], ASK_COPY % (shown(ask["from_name"]), ask["text"], copy),
-                               new_thread=True)
+                thread = self.chat.send(colleague["chat_space"], ASK_COPY % (
+                    shown(ask["from_name"]), short_text(ask["text"], ASK_COPY_QUESTION_CHARS), copy), new_thread=True)
+                if thread:                                 # a reply there is the colleague's correction
+                    self.state.update(ask["ask"], copy_thread=thread)
             except Exception as e:                         # noqa: BLE001
                 log.warning("could not copy the answer to ask %s to %s: %s", ask["ask"], ask["to"], e.__class__.__name__)
         return True
@@ -1349,14 +1401,17 @@ class Bridge:
         return self._post_received(ask, post)
 
     def _closed_ask_thread(self, user, thread):
-        """True when `thread` is the approval thread (user asked) or received thread (user was asked) of a closed ask."""
+        """The reply for a message in a thread of a closed ask (the approval thread when user asked, the received or
+        copy thread when user was asked); None when the thread is no closed ask's."""
         for a in self.state.asks():
             if a.get("closed_at") is None:
                 continue
             if (a["from"] == user and a.get("approval_thread") == thread) or \
                     (a["to"] == user and a.get("received_thread") == thread):
-                return True
-        return False
+                return ASK_CLOSED
+            if a["to"] == user and a.get("copy_thread") == thread:
+                return ASK_ALREADY_DELIVERED % shown(a.get("from_name") or a["from"])
+        return None
 
     def check_asks(self):
         """Run with the outbox (nudger thread): questions nobody approved in time expire, a hand-over whose post failed

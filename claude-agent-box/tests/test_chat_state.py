@@ -159,5 +159,37 @@ class TestChatState(Base):
         self.assertEqual(len({t["ref"] for t in tasks}), 30)    # no ref handed out twice
 
 
+    def test_a_reply_run_counts_against_the_daily_task_limit(self):
+        # M1: follow-up replies run the agent too, so each one counts like a new task
+        self.st.new_task("asha", "T1", "u1")
+        self.st.log_task_run("asha"); self.st.log_task_run("asha")
+        self.st.log_task_run("ravi")
+        self.assertEqual(self.st.count_today("task", "asha"), 3)
+        self.assertEqual(self.st.count_today("task", "ravi"), 1)
+        self.assertEqual(len(self.st.tasks()), 1)                           # a reply is not a new task row
+        self.now[0] = epoch(2026, 11, 27, 0, 1)
+        self.assertEqual(self.st.count_today("task", "asha"), 0)
+
+    def test_the_copy_thread_of_an_auto_answered_ask_belongs_to_the_colleague(self):
+        # M2: the "Your agent answered ..." copy thread routes to the ask while it is open
+        self.st.new_ask("asha", "ravi", "q", "a0123456789")
+        self.st.update("a0123456789", copy_thread="spaces/R/threads/CP")
+        role, item = self.st.item_by_thread("ravi", "spaces/R/threads/CP")
+        self.assertEqual((role, item["ask"]), ("copy", "a0123456789"))
+        self.assertIsNone(self.st.item_by_thread("asha", "spaces/R/threads/CP"))   # the colleague's thread only
+        self.st.close("a0123456789")
+        self.assertIsNone(self.st.item_by_thread("ravi", "spaces/R/threads/CP"))
+
+    def test_json_that_is_not_an_object_reads_like_a_corrupt_file(self):
+        # M10: a list (or a number) on disk must not break every lookup
+        for junk in ("[]", "[1, 2]", "7", "null", '"x"'):
+            with open(self.path, "w") as f:
+                f.write(junk)
+            self.assertIsNone(self.st.item_by_thread("asha", "T1"))
+            self.assertEqual(self.st.tasks(), [])
+            self.assertEqual(self.st.count_today("task", "asha"), 0)
+            self.assertEqual(self.st.new_task("asha", "T1", "u1")["ref"], "t1")
+
+
 if __name__ == "__main__":
     unittest.main()

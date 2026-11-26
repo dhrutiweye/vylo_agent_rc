@@ -100,9 +100,16 @@ def build_argv(mode, request):
     return argv
 
 
+def defuse_markers(text):
+    """Every run of 3+ '<' or '>' cut to two, so the question cannot open or close the <<<QUESTION quote itself (the
+    bridge does the same for a do-it prompt). One pass is enough: a cut run never joins its neighbours into a new one."""
+    return re.sub(r">{3,}", ">>", re.sub(r"<{3,}", "<<", text))
+
+
 def prompt_text(mode, request):
     if mode == "ask":
-        return ASK_WRAP.format(asker=str(request.get("asker") or "a colleague"), prompt=request["prompt"].strip())
+        return ASK_WRAP.format(asker=str(request.get("asker") or "a colleague"),
+                               prompt=defuse_markers(request["prompt"].strip()))
     return request["prompt"]
 
 

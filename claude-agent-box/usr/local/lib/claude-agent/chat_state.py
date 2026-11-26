@@ -46,6 +46,8 @@ class ChatState:
                 d = json.load(f)
         except (FileNotFoundError, ValueError):
             return self._empty()
+        if not isinstance(d, dict):                        # a list or a number: as corrupt as bad JSON
+            return self._empty()
         for k, v in self._empty().items():
             d.setdefault(k, v)
         return d
@@ -96,6 +98,13 @@ class ChatState:
             d["task_log"] = [e for e in d["task_log"] if now - e[1] < TASK_LOG_KEPT_SECONDS] + [[user, now]]
             return dict(t)
         return self._modify(fn)
+
+    def log_task_run(self, user):
+        """A reply in a task's thread runs the agent again: it counts against the daily task limit like a new task."""
+        def fn(d):
+            now = self.now()
+            d["task_log"] = [e for e in d["task_log"] if now - e[1] < TASK_LOG_KEPT_SECONDS] + [[user, now]]
+        self._modify(fn)
 
     # ---- asks
     def new_ask(self, from_user, to_user, text, ask_id):
@@ -156,6 +165,8 @@ class ChatState:
                 return "approval", dict(a)
             if a["to"] == user and a.get("received_thread") == thread:
                 return "received", dict(a)
+            if a["to"] == user and a.get("copy_thread") == thread:      # "Your agent answered ...": a correction
+                return "copy", dict(a)
         return None
 
     def count_today(self, kind, user):
