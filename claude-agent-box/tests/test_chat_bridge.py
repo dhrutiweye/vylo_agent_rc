@@ -19,9 +19,18 @@ CODE = "ZkQ9-sample_oauth_code_ABCDEF0123456789#state_0123456789"
 class FakeChat:
     def __init__(self):
         self.sent = []
+        self.threads = 0
 
-    def send(self, space, text):
-        self.sent.append((space, text))
+    def send(self, space, text, thread=None, new_thread=False):
+        """Records (space, text) as before, or (space, text, thread) when a thread was asked for; returns the thread."""
+        if thread is None and not new_thread:
+            self.sent.append((space, text))
+            return None
+        if not thread:
+            self.threads += 1
+            thread = "%s/threads/T%d" % (space, self.threads)
+        self.sent.append((space, text, thread))
+        return thread
 
     def last(self):
         return self.sent[-1][1]
@@ -112,16 +121,22 @@ class FakeSource:
         self.acked += ids
 
 
-def classic(text, email="asha@co.test", space="spaces/DM1", dm=True, user="users/1", sender_type="HUMAN", etype="MESSAGE"):
-    return {"type": etype, "space": {"name": space, "type": "DM" if dm else "ROOM", "singleUserBotDm": dm},
-            "message": {"text": text, "argumentText": text, "sender": {"name": user, "email": email, "type": sender_type}},
-            "user": {"name": user, "email": email}}
+def classic(text, email="asha@co.test", space="spaces/DM1", dm=True, user="users/1", sender_type="HUMAN", etype="MESSAGE", thread=None):
+    ev = {"type": etype, "space": {"name": space, "type": "DM" if dm else "ROOM", "singleUserBotDm": dm},
+          "message": {"text": text, "argumentText": text, "sender": {"name": user, "email": email, "type": sender_type}},
+          "user": {"name": user, "email": email}}
+    if thread:
+        ev["message"]["thread"] = {"name": thread}
+    return ev
 
 
-def addon(text, email="asha@co.test", space="spaces/DM1"):
-    return {"chat": {"user": {"name": "users/1", "email": email},
-                     "messagePayload": {"space": {"name": space, "spaceType": "DIRECT_MESSAGE"},
-                                        "message": {"text": text, "sender": {"name": "users/1", "email": email}}}}}
+def addon(text, email="asha@co.test", space="spaces/DM1", thread=None):
+    ev = {"chat": {"user": {"name": "users/1", "email": email},
+                   "messagePayload": {"space": {"name": space, "spaceType": "DIRECT_MESSAGE"},
+                                      "message": {"text": text, "sender": {"name": "users/1", "email": email}}}}}
+    if thread:
+        ev["chat"]["messagePayload"]["message"]["thread"] = {"name": thread}
+    return ev
 
 
 class Base(unittest.TestCase):
@@ -173,6 +188,46 @@ class TestParsing(unittest.TestCase):
     def test_room_is_not_a_dm_and_email_is_lowercased(self):
         m = cb.normalize(classic("hi", email="Asha@CO.test", dm=False))
         self.assertFalse(m["dm"]); self.assertEqual(m["email"], "asha@co.test")
+
+
+    def test_thread_name_is_read_from_both_event_shapes(self):
+        t = "spaces/DM1/threads/T9"
+        self.assertEqual(cb.normalize(classic("hi", thread=t))["thread"], t)
+        self.assertEqual(cb.normalize(addon("hi", thread=t))["thread"], t)
+        self.assertEqual(cb.normalize(classic("hi"))["thread"], "")
+        self.assertEqual(cb.normalize(addon("hi"))["thread"], "")
+
+    def test_send_without_thread_is_unchanged(self):
+        posts = []
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"thread": {"name": "spaces/DM1/threads/NEW"}}
+
+        class Sess:
+            def post(self, url, json=None, timeout=None, params=None):
+                posts.append((url, json, params)); return Resp()
+
+        g = cb.GoogleChat.__new__(cb.GoogleChat); g.session = Sess()
+        g.send("spaces/DM1", "hello")
+        self.assertEqual(posts[-1][1], {"text": "hello"})
+        self.assertEqual(g.send("spaces/DM1", "in thread", thread="spaces/DM1/threads/T1"), "spaces/DM1/threads/NEW")
+        self.assertEqual(posts[-1][1], {"text": "in thread", "thread": {"name": "spaces/DM1/threads/T1"}})
+        g.send("spaces/DM1", "fresh", new_thread=True)
+        self.assertIn("threadKey", posts[-1][1]["thread"])
+        for _, _, params in posts:
+            self.assertEqual(params, {"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"})
+        fake = FakeChat()
+        fake.send("spaces/DM1", "plain")
+        self.assertEqual(fake.sent, [("spaces/DM1", "plain")])
+        self.assertEqual(fake.send("spaces/DM1", "x", new_thread=True), "spaces/DM1/threads/T1")
+
+    def test_config_has_the_chat_limits(self):
+        c = cb.Config({})
+        self.assertEqual((c.chat_tasks_per_day, c.chat_runs_at_once, c.asks_per_day, c.asks_received_per_day,
+                          c.ask_approval_seconds, c.ask_dm_fallback_seconds, c.chat_result_chars),
+                         (30, 2, 10, 20, 7200, 120, 1500))
+        self.assertEqual(cb.Config({"CHAT_TASKS_PER_DAY": "5"}).chat_tasks_per_day, 5)
 
 
 class TestOnboarding(Base):

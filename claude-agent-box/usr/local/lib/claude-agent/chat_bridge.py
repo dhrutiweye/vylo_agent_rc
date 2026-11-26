@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 
 from agent_outbox import label
@@ -95,6 +96,13 @@ class Config:
         self.admin_person = env.get("ADMIN_PERSON", "").strip()   # box alerts (claude-agent-monitor) go to them
         self.outbox_per_hour = int(env.get("OUTBOX_PER_HOUR", "20"))   # doorbell messages delivered per person per hour
         self.sessions_kept = int(env.get("SESSIONS_KEPT", "5"))         # earlier sessions remembered for `switch`
+        self.chat_tasks_per_day = int(env.get("CHAT_TASKS_PER_DAY", "30"))
+        self.chat_runs_at_once = int(env.get("CHAT_RUNS_AT_ONCE", "2"))
+        self.asks_per_day = int(env.get("ASKS_PER_DAY", "10"))
+        self.asks_received_per_day = int(env.get("ASKS_RECEIVED_PER_DAY", "20"))
+        self.ask_approval_seconds = int(env.get("ASK_APPROVAL_SECONDS", "7200"))
+        self.ask_dm_fallback_seconds = int(env.get("ASK_DM_FALLBACK_SECONDS", "120"))
+        self.chat_result_chars = int(env.get("CHAT_RESULT_CHARS", "1500"))
 
 
 # ------------------------------------------------------------------ people store (shared with add-colleague.sh)
@@ -183,6 +191,7 @@ def normalize(event):
         "bot": user.get("type") == "BOT",
         "text": text,
         "id": msg.get("name") or "",                       # spaces/X/messages/Y: the same on a Pub/Sub redelivery
+        "thread": (msg.get("thread") or {}).get("name") or "",   # spaces/X/threads/Z, "" when absent
     }
 
 
@@ -913,9 +922,21 @@ class GoogleChat:
             cfg.key_path, scopes=["https://www.googleapis.com/auth/chat.bot"])
         self.session = AuthorizedSession(creds)
 
-    def send(self, space, text):
-        r = self.session.post("https://chat.googleapis.com/v1/%s/messages" % space, json={"text": text}, timeout=20)
+    def send(self, space, text, thread=None, new_thread=False):
+        """Post text; return the thread name of the posted message. thread= replies in that thread, new_thread=True
+        opens a fresh one, neither behaves as before (a plain message; Chat starts its own thread)."""
+        body = {"text": text}
+        if thread:
+            body["thread"] = {"name": thread}
+        elif new_thread:
+            body["thread"] = {"threadKey": "vylo-%s" % uuid.uuid4().hex}
+        r = self.session.post("https://chat.googleapis.com/v1/%s/messages" % space, json=body, timeout=20,
+                              params={"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"})
         r.raise_for_status()
+        try:
+            return (r.json().get("thread") or {}).get("name") or None
+        except ValueError:
+            return None
 
 
 class SystemHost:
