@@ -21,10 +21,12 @@ echo "== installer"
 for f in usr/local/lib/claude-agent/agent_sessions.py usr/local/bin/agent-max-sessions usr/local/bin/sessions-enable \
          etc/systemd/system/claudeagents.slice usr/local/bin/claude-agent-monitor \
          etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer \
-         usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh; do
+         usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh usr/local/bin/agent-chat-exec \
+         usr/local/lib/claude-agent/agent_secrets.py usr/local/lib/claude-agent/chat_state.py; do
   grep -q "$(basename "$f")" "$I"; ok $? "install-box.sh installs $f"
 done
 grep -q 'agent-sessions.conf' "$I"; ok $? "install-box.sh installs agent-sessions.conf"
+grep -qE 'install -d -m 700 /var/lib/claude-agent-chat' "$I"; ok $? "install-box.sh creates /var/lib/claude-agent-chat (700)"
 grep -E 'agent-sessions\.conf' "$I" | grep -q '\[ ! -f /etc/claude-code/agent-sessions.conf \]'; ok $? "agent-sessions.conf is installed only when missing"
 grep -E 'install .*agent-sessions\.conf' "$I" | grep -q -- '-m 644'; ok $? "agent-sessions.conf is mode 644"
 

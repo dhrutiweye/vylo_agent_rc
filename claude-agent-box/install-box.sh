@@ -27,11 +27,13 @@ put() {  # put <mode> <relative path in bundle>   (destination = / + relative pa
 # scripts first, the policy files (what the live agent reads) last
 for f in agent-start agent-run claude-agent-watch-all claude-audit.sh claude-agent-report add-colleague.sh \
          remove-colleague.sh vylo-mirror-refresh.sh vylo-mirror-sync.sh gh-token-check.sh set-gh-token.sh jira-token-check.sh set-jira-token.sh set-litellm-key.sh claude-agent-seed-template.sh \
-         notify-me agent-job agent-job-exec claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor lock-box-rules; do put 755 "usr/local/bin/$f"; done
+         notify-me agent-job agent-job-exec agent-chat-exec claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor lock-box-rules; do put 755 "usr/local/bin/$f"; done
 put 644 usr/local/lib/claude-agent/chat_bridge.py
 put 644 usr/local/lib/claude-agent/agent_outbox.py
 put 644 usr/local/lib/claude-agent/agent_jobs.py
 put 644 usr/local/lib/claude-agent/agent_sessions.py
+put 644 usr/local/lib/claude-agent/agent_secrets.py
+put 644 usr/local/lib/claude-agent/chat_state.py
 put 755 usr/local/share/claude-agent/kit/bin/mcp-jira.sh
 for u in claude-agent.service claude-agent@.service claude-agent-watch.service claude-agent-watch.timer \
          claude-agent-watch-all.service claude-agent-watch-all.timer claude-agent-bridge.service \
@@ -40,6 +42,7 @@ put 644 "etc/systemd/system/claude-agent@.service.d/limits.conf"   # per-colleag
 put 644 etc/needrestart/conf.d/50-claude-agent.conf
 if [ ! -f /etc/claude-agent/bridge.env ]; then install -m 640 -o root -g root "$HERE/etc/claude-agent/bridge.env.example" /etc/claude-agent/bridge.env; fi
 put 644 etc/claude-agent/bridge.env.example
+install -d -m 700 /var/lib/claude-agent-chat     # Chat tasks and asks state (root only: holds open question text)
 install -d -m 711 /var/lib/claude-agent-jobs     # runner state, one file per colleague (readable by that colleague)
 put 755 usr/local/bin/claude-guard.sh
 put 644 etc/claude-code/managed-settings.json
