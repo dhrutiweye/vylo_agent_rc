@@ -259,8 +259,21 @@ t deny  Read "{\"file_path\":\"$V/x/.env.production\"}"; t deny Read "{\"file_pa
 t deny  Read "{\"file_path\":\"$V/x/.env\"}"; t deny Read "{\"file_path\":\"$V/.envs/prod.yml\"}"
 t deny  Read "{\"file_path\":\"$V/../secret\"}"; t deny Read "{\"file_path\":\"$V-evil/x\"}"
 t deny  Read '{"file_path":"../../etc/passwd"}' "$V/repo1"
-t allow Grep '{"pattern":"x"}' "$V"; t allow Grep '{"pattern":"x"}' "$V/repo1"; t allow Glob '{"pattern":"**/*.java"}' "$V"
-t allow Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1\"}"; t allow Glob "{\"pattern\":\"*.md\",\"path\":\"$V\"}"
+# Grep on a folder (or no path = cwd) only names files or counts matches; content and context only from one plain
+# file. Replaces the plain "Grep {pattern} on $V / $V/repo1 allow" cases.
+t allow Grep '{"pattern":"x","output_mode":"files_with_matches"}' "$V"; t allow Grep '{"pattern":"x","output_mode":"count"}' "$V"
+t allow Grep '{"pattern":"x","output_mode":"files_with_matches"}' "$V/repo1"; t allow Glob '{"pattern":"**/*.java"}' "$V"
+t allow Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1\",\"output_mode\":\"count\"}"; t allow Glob "{\"pattern\":\"*.md\",\"path\":\"$V\"}"
+t deny  Grep '{"pattern":"x","output_mode":"content"}' "$V"; t deny Grep '{"pattern":"x"}' "$V"
+t deny  Grep '{"pattern":"x"}' "$V/repo1"; t deny Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1\"}"
+t deny  Grep '{"pattern":"x","output_mode":"files_with_matches","-C":3}' "$V"
+t deny  Grep '{"pattern":"x","output_mode":"count","-A":1}' "$V"; t deny Grep '{"pattern":"x","output_mode":"files_with_matches","-B":1}' "$V"
+t deny  Grep '{"pattern":"x","output_mode":"weird"}' "$V"
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1/nope.txt\",\"output_mode\":\"content\"}"   # not a plain file
+t allow Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1/sub/a.txt\",\"output_mode\":\"content\"}"
+t allow Grep '{"pattern":"x","path":"sub/a.txt","output_mode":"content","-C":2,"-n":true}' "$V/repo1"
+t allow Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1/sub/a.txt\"}"
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$V/x/.env.production\",\"output_mode\":\"content\"}"
 t deny  Grep '{}'; t deny Glob '{}'                                     # no path and cwd / (outside vylo)
 t deny  Grep "{\"pattern\":\"x\",\"path\":\"$HOME\"}" "$V"; t deny Glob "{\"pattern\":\"*\",\"path\":\"$HOME/.ssh\"}" "$V"
 t deny  Grep "{\"pattern\":\"KEY\",\"path\":\"$V\",\"glob\":\"*.env*\"}"
@@ -268,6 +281,21 @@ t deny  Glob '{"pattern":"/home/*/.aws/*"}' "$V"; t deny Glob '{"pattern":"../**
 ln -s "$HOME/secret" "$V/x/link"; ln -s /etc "$V/x/etc"
 t deny  Read "{\"file_path\":\"$V/x/link\"}"; t deny Grep "{\"pattern\":\"x\",\"path\":\"$V/x/etc\"}"
 t deny  ReadMcpResourceTool '{"server":"wheelseye-jira-mcp","uri":"x"}'; t deny ListMcpResourcesTool '{}'
+# names that hold keys, settings or repo internals, in any case
+mkdir -p "$V/repo1/src"; : >"$V/repo1/src/KeyService.java"; : >"$V/x/server.pem"
+for f in x/.ENV x/Prod.Env x/STAGE.ENV.local repo1/.git/config repo1/.git repo1/.GIT/HEAD repo1/.claude/settings.json \
+         repo1/.Claude/x repo1/.mcp.json repo1/sub/.MCP.JSON x/server.pem x/ca.PEM x/tls.key x/tls.KEY x/cert.p12 \
+         x/id_rsa x/ID_RSA.pub x/id_rsa_work x/application.properties x/App.PROPERTIES x/aws_credentials.txt \
+         x/Credentials x/my-secret.yaml x/SECRETS/a.txt x/client_Secret.json; do
+  t deny Read "{\"file_path\":\"$V/$f\"}"
+done
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1/.git\",\"output_mode\":\"files_with_matches\"}"
+t deny  Glob "{\"pattern\":\"*\",\"path\":\"$V/repo1/.claude\"}"
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$V\",\"output_mode\":\"files_with_matches\",\"glob\":\"*.PEM\"}"
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$V\",\"output_mode\":\"count\",\"glob\":\"**/*secret*\"}"
+ln -s server.pem "$V/x/plain.txt"; t deny Read "{\"file_path\":\"$V/x/plain.txt\"}"   # resolves to a .pem
+t allow Read "{\"file_path\":\"$V/repo1/src/KeyService.java\"}"; t allow Read "{\"file_path\":\"$V/x/keys.md\"}"
+t allow Read "{\"file_path\":\"$V/repo1/.github/workflows/ci.yml\"}"; t allow Read "{\"file_path\":\"$V/repo1/environment.md\"}"
 t deny  Skill '{"skill":"x"}'; t deny Agent '{"prompt":"x"}'; t deny Task '{"prompt":"x"}'
 t deny  WebSearch '{"query":"x"}'; t deny EnterWorktree '{}'; t deny Monitor '{}'; t deny SomethingNew '{}'
 REALHOME=$HOME; export HOME=$T CLAUDE_GUARD_VYLO_DIR=$T                 # even if the vylo folder held the home
@@ -281,6 +309,28 @@ MCP_POLICY_DIR=$NP t allow mcp__wheelseye-jira-mcp__jira_mcp-jira_search '{}'
 MCP_POLICY_DIR=$NP t deny  mcp__plugin_github_github__get_pull_request '{}'
 rm -rf "$NP"
 unset CLAUDE_AGENT_JOB CLAUDE_GUARD_MAX_SESSIONS CLAUDE_GUARD_VYLO_DIR
+
+echo "== the installed guard ignores the test-only overrides"
+# CLAUDE_GUARD_VYLO_DIR, CLAUDE_GUARD_MAX_SESSIONS, MCP_POLICY_DIR and CLAUDE_AUDIT_BIN are for bundle copies under
+# test. A person's settings could set them in the agent's environment, so the copy at /usr/local/bin ignores them.
+# Run a COPY there (a symlink resolves to the bundle path) when that is possible: in the test container, not on the box.
+IG=/usr/local/bin/claude-guard.sh
+if [ ! -e "$IG" ] && [ -w /usr/local/bin ] && cp "$GUARD" "$IG" 2>/dev/null; then
+  BUNDLE_GUARD=$GUARD; GUARD=$IG; REALHOME=$HOME
+  export HOME=$T/ihome; mkdir -p "$HOME/Documents/code/vylo/r"; : >"$HOME/Documents/code/vylo/r/a.txt"
+  export CLAUDE_GUARD_VYLO_DIR=$V CLAUDE_AGENT_JOB=ask-a1
+  t deny  Read "{\"file_path\":\"$V/repo1/sub/a.txt\"}"                      # the override is not the vylo folder
+  t allow Read "{\"file_path\":\"$HOME/Documents/code/vylo/r/a.txt\"}"       # $HOME/Documents/code/vylo is
+  GUARD=$BUNDLE_GUARD t allow Read "{\"file_path\":\"$V/repo1/sub/a.txt\"}"   # a bundle copy still honours it
+  unset CLAUDE_AGENT_JOB
+  CLAUDE_GUARD_MAX_SESSIONS=5 t allow Edit "{\"file_path\":\"$B/a.txt\"}" "$V"     # no override: one session
+  CLAUDE_GUARD_MAX_SESSIONS=5 GUARD=$BUNDLE_GUARD t deny Edit "{\"file_path\":\"$B/a.txt\"}" "$V"
+  t deny  mcp__MongoDB__find '{}'                                                # MCP_POLICY_DIR (admin) ignored
+  GUARD=$BUNDLE_GUARD t allow mcp__MongoDB__find '{}'
+  rm -f "$IG"; GUARD=$BUNDLE_GUARD; export HOME=$REALHOME; unset CLAUDE_GUARD_VYLO_DIR
+else
+  echo "SKIP installed-copy cases ($IG exists or /usr/local/bin is not writable)"
+fi
 
 echo "== cd changes which repo a later git command means"
 t deny  Bash "cd $T/on-master && git push" "$T/on-feature-x"

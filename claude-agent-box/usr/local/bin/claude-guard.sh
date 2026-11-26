@@ -17,6 +17,11 @@
 # Matches command TEXT, not intent: a write hidden in a script file, `python -c`, or an unusual
 # client is not caught (a base copy can still be written that way). Every deny/ask is written to the audit log.
 set -o pipefail
+# The installed guard (/usr/local/bin/claude-guard.sh) ignores the overrides that exist for bundle copies under test:
+# a person's settings can put any of them in the agent's environment, and each one loosens a rule.
+INSTALLED=0
+[ "$(realpath "$0" 2>/dev/null)" = /usr/local/bin/claude-guard.sh ] && INSTALLED=1
+[ "$INSTALLED" = 1 ] && unset CLAUDE_GUARD_VYLO_DIR CLAUDE_GUARD_MAX_SESSIONS MCP_POLICY_DIR CLAUDE_AUDIT_BIN
 in=$(cat)
 tool=$(jq -r '.tool_name // empty' <<<"$in")
 session=$(jq -r '.session_id // empty' <<<"$in")
@@ -51,8 +56,15 @@ VYLO=${CLAUDE_GUARD_VYLO_DIR:-$HOME/Documents/code/vylo}
 # the Jira and GitHub MCP servers (exact server names; the verb is judged as in mcp_check). Everything else is refused.
 # The person's own MCP allow-list still applies on top (mcp_check runs after this). agent-chat-exec starts an answer
 # run with a PreToolUse hook matching every tool, so Read/Grep/Glob/WebFetch/Skill/... all reach this rule.
-answer_path_ok() {  # $1 = path as given (empty = the run's cwd): true when an answer run may read it
-  local p=$1 base=${cwd:-} v r h c
+secret_name() {  # $1 = one path component or glob: true when it names keys, settings or repo internals (any case)
+  case "${1,,}" in
+    *.env*|.git|.claude*|.mcp.json|*.pem|*.key|*.p12|id_rsa*|*.properties|*credentials*|*secret*) return 0 ;;
+  esac
+  return 1
+}
+AP_RESOLVED=""
+answer_path_ok() {  # $1 = path as given (empty = the run's cwd): true when an answer run may read it; sets AP_RESOLVED
+  local p=$1 base=${cwd:-} v r h c lv lp rel
   [ -n "$base" ] || return 1
   [ -n "$p" ] || p=$base
   case "$p" in "~") p=$HOME ;; "~/"*) p=$HOME/${p#"~/"} ;; "~"*) return 1 ;; esac   # ~other: someone else's home
@@ -62,10 +74,24 @@ answer_path_ok() {  # $1 = path as given (empty = the run's cwd): true when an a
   [[ $r == "$v" || $r == "$v"/* ]] || return 1
   h=$(realpath -m "$HOME" 2>/dev/null) || return 1
   case "$r/" in "$h"/.claude*|"$h"/.config/*|"$h"/.ssh/*) return 1 ;; esac
+  # Names inside the vylo folder, as resolved and as typed (lexically, so a symlink's own name counts too).
+  rel=${r#"$v"}
+  lv=$(realpath -m -s "$VYLO" 2>/dev/null) || return 1
+  lp=$(realpath -m -s "$p" 2>/dev/null) || return 1
+  if [[ $lp == "$lv"/* ]]; then rel+=/${lp#"$lv"/}; else rel+=/${lp##*/}; fi
   local -a parts
-  IFS=/ read -r -d '' -a parts < <(printf '%s/%s' "$p" "$r")   # every name, as typed and as resolved (no globbing)
+  IFS=/ read -r -d '' -a parts < <(printf '%s' "$rel")    # read -a: no globbing of the names
   for c in "${parts[@]}"; do
-    case "$c" in *.env*) return 1 ;; esac
+    [ -n "$c" ] && secret_name "$c" && return 1
+  done
+  AP_RESOLVED=$r
+  return 0
+}
+grep_glob_ok() {  # $1 = Grep's glob: false when it aims at secret names
+  local -a parts; local c
+  IFS='/{},' read -r -d '' -a parts < <(printf '%s' "$1")
+  for c in "${parts[@]}"; do
+    [ -n "$c" ] && secret_name "$c" && return 1
   done
   return 0
 }
@@ -80,7 +106,15 @@ case "${CLAUDE_AGENT_JOB:-}" in
       Grep|Glob)
         answer_path_ok "$(jq -r '.tool_input.path // empty' <<<"$in")" || decide deny "$_no"
         if [ "$tool" = Grep ]; then
-          case "$(jq -r '.tool_input.glob // empty' <<<"$in")" in *.env*) decide deny "$_no" ;; esac
+          grep_glob_ok "$(jq -r '.tool_input.glob // empty' <<<"$in")" || decide deny "$_no"
+          if [ ! -f "$AP_RESOLVED" ]; then                 # a folder: name the files or count, never show lines
+            case "$(jq -r '.tool_input.output_mode // empty' <<<"$in")" in
+              files_with_matches|count) ;;
+              *) decide deny "An answer run may search a folder only for file names or counts (output_mode files_with_matches or count); read one file to see its lines." ;;
+            esac
+            [ "$(jq -r '.tool_input | has("-A") or has("-B") or has("-C") or has("context")' <<<"$in")" = false ] \
+              || decide deny "An answer run may show context lines only from one file, not a folder."
+          fi
         else                                             # the pattern may carry a path of its own
           _g=$(jq -r '.tool_input.pattern // empty' <<<"$in")
           case "/$_g/" in //*|/~*|*/../*) decide deny "$_no" ;; esac
@@ -99,7 +133,7 @@ esac
 # ---------------------------------------------------------------- base copies (several sessions per person)
 MS=""
 SESSIONS_HELPER=/usr/local/bin/agent-max-sessions   # by absolute path: the agent can put its own first on PATH
-if [ "$(realpath "$0" 2>/dev/null)" != /usr/local/bin/claude-guard.sh ] && [ -x "$(dirname "$0")/agent-max-sessions" ]; then
+if [ "$INSTALLED" = 0 ] && [ -x "$(dirname "$0")/agent-max-sessions" ]; then
   SESSIONS_HELPER=$(dirname "$0")/agent-max-sessions                 # a bundle copy under test uses its own
 fi
 multi_session() {  # true when this person's agent serves more than one session; asked once per call

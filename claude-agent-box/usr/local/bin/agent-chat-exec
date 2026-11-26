@@ -96,7 +96,10 @@ def build_argv(mode, request):
     preamble = {"task": TASK_PREAMBLE, "doit": DOIT_PREAMBLE, "ask": ASK_PREAMBLE}[mode]
     argv += ["--append-system-prompt", preamble.format(user=who, asker=asker)]
     if mode == "ask":                       # --disallowedTools last: the option takes a list, so nothing may follow it
-        argv += ["--tools", ASK_TOOLS, "--settings", ASK_SETTINGS, "--disallowedTools", ASK_DISALLOWED]
+        # --setting-sources "": no user, project or local settings (their env or disableAllHooks could loosen the run);
+        # managed settings and --settings still load. --tools is variadic, so a flag must follow it.
+        argv += ["--tools", ASK_TOOLS, "--setting-sources", "", "--settings", ASK_SETTINGS,
+                 "--disallowedTools", ASK_DISALLOWED]
     return argv
 
 
