@@ -27,7 +27,7 @@ put() {  # put <mode> <relative path in bundle>   (destination = / + relative pa
 # scripts first, the policy files (what the live agent reads) last
 for f in agent-start agent-run claude-agent-watch-all claude-audit.sh claude-agent-report add-colleague.sh \
          remove-colleague.sh vylo-mirror-refresh.sh vylo-mirror-sync.sh gh-token-check.sh set-gh-token.sh jira-token-check.sh set-jira-token.sh set-litellm-key.sh claude-agent-seed-template.sh \
-         notify-me agent-job agent-job-exec agent-chat-exec ask-colleague claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor lock-box-rules; do put 755 "usr/local/bin/$f"; done
+         notify-me agent-job agent-job-exec agent-chat-exec ask-colleague claude-agent-jobs agent-max-sessions sessions-enable claude-agent-monitor claude-agent-cleanup lock-box-rules; do put 755 "usr/local/bin/$f"; done
 put 644 usr/local/lib/claude-agent/chat_bridge.py
 put 644 usr/local/lib/claude-agent/agent_outbox.py
 put 644 usr/local/lib/claude-agent/agent_jobs.py
@@ -37,7 +37,7 @@ put 644 usr/local/lib/claude-agent/chat_state.py
 put 755 usr/local/share/claude-agent/kit/bin/mcp-jira.sh
 for u in claude-agent.service claude-agent@.service claude-agent-watch.service claude-agent-watch.timer \
          claude-agent-watch-all.service claude-agent-watch-all.timer claude-agent-bridge.service \
-         vylo-mirror-sync.service vylo-mirror-sync.timer claude-agent-jobs.service claudeagents.slice claude-agent-monitor.service claude-agent-monitor.timer; do put 644 "etc/systemd/system/$u"; done
+         vylo-mirror-sync.service vylo-mirror-sync.timer claude-agent-jobs.service claudeagents.slice claude-agent-monitor.service claude-agent-monitor.timer claude-agent-cleanup.service claude-agent-cleanup.timer; do put 644 "etc/systemd/system/$u"; done
 put 644 "etc/systemd/system/claude-agent@.service.d/limits.conf"   # per-colleague CPU, memory and task caps
 put 644 etc/needrestart/conf.d/50-claude-agent.conf
 if [ ! -f /etc/claude-agent/bridge.env ]; then install -m 640 -o root -g root "$HERE/etc/claude-agent/bridge.env.example" /etc/claude-agent/bridge.env; fi
@@ -68,6 +68,7 @@ systemctl daemon-reload
 systemctl enable --now claude-agent-watch-all.timer >/dev/null 2>&1 || true
 systemctl enable --now vylo-mirror-sync.timer >/dev/null 2>&1 || true
 systemctl enable --now claude-agent-monitor.timer >/dev/null 2>&1 || true   # box load every 5 min -> /var/log/claude-agent-load.jsonl
+systemctl enable --now claude-agent-cleanup.timer >/dev/null 2>&1 || true   # daily 09:00 IST: Docker, temp files, old results, finished worktrees
 systemctl enable claude-agent-jobs.service >/dev/null 2>&1 || true
 systemctl restart claude-agent-jobs.service >/dev/null 2>&1 || true   # picks up a new runner; running task units are not touched
 [ -d "$BK" ] && echo "previous versions saved in $BK"

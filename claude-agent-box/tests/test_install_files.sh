@@ -21,6 +21,7 @@ echo "== installer"
 for f in usr/local/lib/claude-agent/agent_sessions.py usr/local/bin/agent-max-sessions usr/local/bin/sessions-enable \
          etc/systemd/system/claudeagents.slice usr/local/bin/claude-agent-monitor \
          etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer \
+         usr/local/bin/claude-agent-cleanup etc/systemd/system/claude-agent-cleanup.service etc/systemd/system/claude-agent-cleanup.timer \
          usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh usr/local/bin/agent-chat-exec usr/local/bin/ask-colleague \
          usr/local/lib/claude-agent/agent_secrets.py usr/local/lib/claude-agent/chat_state.py; do
   grep -q "$(basename "$f")" "$I"; ok $? "install-box.sh installs $f"
@@ -31,6 +32,15 @@ grep -E 'agent-sessions\.conf' "$I" | grep -q '\[ ! -f /etc/claude-code/agent-se
 grep -E 'install .*agent-sessions\.conf' "$I" | grep -q -- '-m 644'; ok $? "agent-sessions.conf is mode 644"
 
 grep -q 'enable --now claude-agent-monitor.timer' "$I"; ok $? "install-box.sh starts the monitor timer"
+grep -q 'enable --now claude-agent-cleanup.timer' "$I"; ok $? "install-box.sh starts the cleanup timer"
+grep -E 'claude-agent-cleanup( |;)' "$I" | grep -q 'put 755'; ok $? "cleanup script installed mode 755"
+grep -E 'claude-agent-cleanup.timer' "$I" | grep -q 'put 644'; ok $? "cleanup units installed mode 644"
+grep -qxF 'OnCalendar=*-*-* 03:30:00 UTC' "$R/etc/systemd/system/claude-agent-cleanup.timer"; ok $? "cleanup daily 09:00 IST"
+grep -qx 'Persistent=true' "$R/etc/systemd/system/claude-agent-cleanup.timer"; ok $? "cleanup timer is persistent"
+grep -qx 'RandomizedDelaySec=15min' "$R/etc/systemd/system/claude-agent-cleanup.timer"; ok $? "cleanup timer randomised 15 min"
+grep -qx 'ExecStart=/usr/local/bin/claude-agent-cleanup' "$R/etc/systemd/system/claude-agent-cleanup.service"; ok $? "cleanup service runs the script"
+grep -qx 'Type=oneshot' "$R/etc/systemd/system/claude-agent-cleanup.service" && grep -qx 'Nice=10' "$R/etc/systemd/system/claude-agent-cleanup.service" && grep -qx 'IOSchedulingClass=idle' "$R/etc/systemd/system/claude-agent-cleanup.service"; ok $? "cleanup service: oneshot, Nice=10, idle IO"
+head -1 "$R/usr/local/bin/claude-agent-cleanup" | grep -qx '#!/usr/bin/python3 -I'; ok $? "cleanup script is isolated python3"
 grep -q 'lock-box-rules --refresh-all' "$I"; ok $? "install-box.sh refreshes locked copies of the box rules"
 [ "$(grep -n 'lock-box-rules --refresh-all' "$I" | cut -d: -f1)" -gt "$(grep -n 'put 644 etc/claude-code/managed-settings.json' "$I" | cut -d: -f1)" ]
 ok $? "the refresh runs after the new managed-settings.json is in place"

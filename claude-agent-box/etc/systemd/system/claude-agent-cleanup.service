@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily disk cleanup of the agent box (Docker, journal, temp files, old results, finished worktrees)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/claude-agent-cleanup
+Nice=10
+IOSchedulingClass=idle
