@@ -1589,8 +1589,12 @@ class GoogleChat:
             body["thread"] = {"name": thread}
         elif new_thread:
             body["thread"] = {"threadKey": "vylo-%s" % uuid.uuid4().hex}
-        r = self.session.post("https://chat.googleapis.com/v1/%s/messages" % space, json=body, timeout=20,
-                              params={"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"})
+        url = "https://chat.googleapis.com/v1/%s/messages" % space
+        if "thread" in body:                       # the reply option only with a thread: alone, Google answers 400
+            r = self.session.post(url, json=body, timeout=20,
+                                  params={"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"})
+        else:
+            r = self.session.post(url, json=body, timeout=20)
         r.raise_for_status()
         try:
             return (r.json().get("thread") or {}).get("name") or None

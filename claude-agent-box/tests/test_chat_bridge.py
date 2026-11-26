@@ -236,18 +236,23 @@ class TestParsing(unittest.TestCase):
             def json(self): return {"thread": {"name": "spaces/DM1/threads/NEW"}}
 
         class Sess:
-            def post(self, url, json=None, timeout=None, params=None):
-                posts.append((url, json, params)); return Resp()
+            def post(self, url, **kw):
+                posts.append((url, kw.get("json"), kw.get("params"), set(kw))); return Resp()
 
+        reply = {"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"}
+        url = "https://chat.googleapis.com/v1/spaces/DM1/messages"
         g = cb.GoogleChat.__new__(cb.GoogleChat); g.session = Sess()
         g.send("spaces/DM1", "hello")
-        self.assertEqual(posts[-1][1], {"text": "hello"})
+        # a plain send: no reply option and no thread (Google answers 400 "does not specify which message to reply
+        # to" when the option comes without a thread), exactly the request before threads existed
+        self.assertEqual(posts[-1], (url, {"text": "hello"}, None, {"json", "timeout"}))
         self.assertEqual(g.send("spaces/DM1", "in thread", thread="spaces/DM1/threads/T1"), "spaces/DM1/threads/NEW")
-        self.assertEqual(posts[-1][1], {"text": "in thread", "thread": {"name": "spaces/DM1/threads/T1"}})
+        self.assertEqual(posts[-1][:3], (url, {"text": "in thread", "thread": {"name": "spaces/DM1/threads/T1"}}, reply))
         g.send("spaces/DM1", "fresh", new_thread=True)
-        self.assertIn("threadKey", posts[-1][1]["thread"])
-        for _, _, params in posts:
-            self.assertEqual(params, {"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"})
+        self.assertEqual(posts[-1][0], url)
+        self.assertEqual(set(posts[-1][1]), {"text", "thread"})
+        self.assertEqual(set(posts[-1][1]["thread"]), {"threadKey"})
+        self.assertEqual(posts[-1][2], reply)
         fake = FakeChat()
         fake.send("spaces/DM1", "plain")
         self.assertEqual(fake.sent, [("spaces/DM1", "plain")])
