@@ -23,7 +23,9 @@ class AskColleagueTest(unittest.TestCase):
     def run_script(self, args, stdin="", timeout="30", poll="0.05", env_extra=None):
         env = dict(os.environ, HOME=self.home, ASK_COLLEAGUE_POLL_SECONDS=poll, ASK_COLLEAGUE_TIMEOUT_SECONDS=timeout)
         env.update(env_extra or {})
-        return subprocess.Popen([sys.executable, "-I", SCRIPT] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        # stdin is a pipe only for a run that reads the question from it; otherwise the script never touches it
+        return subprocess.Popen([sys.executable, "-I", SCRIPT] + args,
+                                stdin=subprocess.DEVNULL if len(args) > 1 else subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, env=env, universal_newlines=True)
 
     def pending_ask(self, wait=10):
@@ -46,10 +48,12 @@ class AskColleagueTest(unittest.TestCase):
             json.dump(data, f)
 
     def drive(self, args, stdin="", **answer):
-        p = self.run_script(args, stdin=stdin)
-        p.stdin.write(stdin)
-        p.stdin.close()
-        ask = self.pending_ask()
+        p = self.run_script(args)
+        if p.stdin is not None:               # the question is read from stdin: it ends at EOF, so the script is alive
+            p.stdin.write(stdin)
+            p.stdin.close()
+            p.stdin = None                    # communicate() would flush the closed pipe (ValueError on 3.12)
+        ask = self.pending_ask()              # waits for the ask file before the answer is put in the inbox
         self.answer(ask["ask"], **answer)
         out, err = p.communicate(timeout=20)
         return ask, p.returncode, out, err
@@ -78,7 +82,7 @@ class AskColleagueTest(unittest.TestCase):
 
     def test_times_out_with_exit_3(self):
         p = self.run_script(["priya", "q"], timeout="0.3")
-        out, err = p.communicate("", timeout=20)
+        out, err = p.communicate(timeout=20)
         self.assertEqual(p.returncode, 3)
         self.assertIn("No answer yet. It will reach your user's Chat DM when it comes.", out + err)
 
@@ -90,7 +94,7 @@ class AskColleagueTest(unittest.TestCase):
 
     def test_bad_input_exits_1(self):
         p = self.run_script(["Bad Name", "q"])
-        out, err = p.communicate("", timeout=20)
+        out, err = p.communicate(timeout=20)
         self.assertEqual(p.returncode, 1)
         p = self.run_script(["priya"])
         out, err = p.communicate("   ", timeout=20)

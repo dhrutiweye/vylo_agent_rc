@@ -9,7 +9,8 @@ docker run --rm -v "$PWD/claude-agent-box:/src:ro" ubuntu:24.04 bash -c '
   cp -r /src /b && cd /b
   git config --global user.email t@t && git config --global user.name t
   rc=0
-  python3 -m unittest discover -s tests -p "test_*.py" 2>&1 | tail -3 || rc=1
+  out=$(python3 -m unittest discover -s tests -p "test_*.py" 2>&1) || rc=1
+  echo "$out" | tail -3
   for t in tests/test_*.sh; do
     echo "== $t"
     if [ "$t" = tests/test_guard.sh ]; then out=$(bash "$t" usr/local/bin/claude-guard.sh 2>&1); else out=$(bash "$t" 2>&1); fi
