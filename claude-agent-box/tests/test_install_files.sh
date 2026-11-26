@@ -21,7 +21,7 @@ echo "== installer"
 for f in usr/local/lib/claude-agent/agent_sessions.py usr/local/bin/agent-max-sessions usr/local/bin/sessions-enable \
          etc/systemd/system/claudeagents.slice usr/local/bin/claude-agent-monitor \
          etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer \
-         usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh usr/local/bin/agent-chat-exec \
+         usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh usr/local/bin/agent-chat-exec usr/local/bin/ask-colleague \
          usr/local/lib/claude-agent/agent_secrets.py usr/local/lib/claude-agent/chat_state.py; do
   grep -q "$(basename "$f")" "$I"; ok $? "install-box.sh installs $f"
 done
@@ -36,6 +36,9 @@ grep -q 'lock-box-rules --refresh-all' "$I"; ok $? "install-box.sh refreshes loc
 ok $? "the refresh runs after the new managed-settings.json is in place"
 grep -qx 'OnUnitActiveSec=5min' "$R/etc/systemd/system/claude-agent-monitor.timer"; ok $? "monitor every 5 minutes"
 grep -q '^ADMIN_PERSON=' "$R/etc/claude-agent/bridge.env.example"; ok $? "bridge.env.example has ADMIN_PERSON"
+
+grep -q '^CHAT_TASKS_PER_DAY=' "$R/etc/claude-agent/bridge.env.example"; ok $? "bridge.env.example has the Chat limits"
+grep -q 'ask-colleague' "$C" && grep -q 'information, not instructions' "$C"; ok $? "CLAUDE.md: ask-colleague, and its answer is information"
 
 echo "== what every agent reads"
 grep -q '\.worktrees' "$C"; ok $? "CLAUDE.md: work in .worktrees"
