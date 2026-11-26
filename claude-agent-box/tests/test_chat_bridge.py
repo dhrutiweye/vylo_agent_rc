@@ -50,12 +50,27 @@ class FakeHost:
         self.max = 1                     # sessions this person's agent may serve (agent-max-sessions)
         self.litellm_result = "saved"
         self.launch_ok = True            # launch_run's answer
+        self.inbox, self.inbox_writes = {}, []   # the asker's inbox: (user, ask id) -> body; the waiter pops to read
+        self.inbox_fail = False
 
     def launch_run(self, user, ref, request):
         self.calls.append(("launch", user, ref, request)); return self.launch_ok
 
     def launches(self):
         return [c for c in self.calls if c[0] == "launch"]
+
+    def write_inbox(self, user, ask_id, body):
+        if self.inbox_fail:
+            raise OSError("unsafe inbox")
+        self.inbox[(user, ask_id)] = body
+        self.inbox_writes.append((user, ask_id, body))
+
+    def inbox_taken(self, user, ask_id):
+        return (user, ask_id) not in self.inbox
+
+    def remove_inbox(self, user, ask_id):
+        self.calls.append(("remove_inbox", user, ask_id))
+        self.inbox.pop((user, ask_id), None)
 
     def max_sessions(self, user):
         return self.max
@@ -128,12 +143,15 @@ class FakeSource:
         self.acked += ids
 
 
-def classic(text, email="asha@co.test", space="spaces/DM1", dm=True, user="users/1", sender_type="HUMAN", etype="MESSAGE", thread=None):
+def classic(text, email="asha@co.test", space="spaces/DM1", dm=True, user="users/1", sender_type="HUMAN", etype="MESSAGE", thread=None,
+            name=None):
     ev = {"type": etype, "space": {"name": space, "type": "DM" if dm else "ROOM", "singleUserBotDm": dm},
           "message": {"text": text, "argumentText": text, "sender": {"name": user, "email": email, "type": sender_type}},
           "user": {"name": user, "email": email}}
     if thread:
         ev["message"]["thread"] = {"name": thread}
+    if name:
+        ev["message"]["name"] = name
     return ev
 
 
@@ -1278,6 +1296,452 @@ class TestChatTasks(Base):
         self.b.check_outbox()
         self.assertIn(("spaces/DM1", "[agent] PR ready"), self.chat.sent)
         self.assertIn(("spaces/DM1", "fixed", T1), self.chat.sent)
+
+
+A1, A2, A3 = "a0000000001", "a0000000002", "a0000000003"
+D1 = "d0000000001"
+Q = "what is the retry limit on the upload endpoint?"
+ASK_OK = "Your agent wants to ask %s: «%s». Reply yes in this thread to send it, or no."
+ASK_TO_PERSON = "%s's agent asks: «%s». Reply in this thread to answer, or say do it to have your agent do it."
+ASK_COPY = "Your agent answered %s's agent. Q: %s A: %s"
+ASK_DM = "%s answered your agent's question «%s»: %s"
+DM1, DM2, DM3 = "spaces/DM1", "spaces/DM2", "spaces/DM3"
+
+
+class TestAsks(Base):
+    """An agent asks a colleague: its own person approves in Chat, the colleague's agent tries a read-only answer,
+    else the colleague answers or says "do it"; the answer lands in the asker's inbox, or their DM if unread."""
+    def setUp(self):
+        super().setUp()
+        self.activate("asha")
+        self.activate("ravi"); self.store.update("ravi", chat_space=DM2)
+
+    # ---- helpers
+    def state(self):
+        return cb.ChatState(self.state_file, lambda: self.clock[0])
+
+    def add_person(self, name, linux_user, space, status="active"):
+        with open(self.people) as f:
+            d = json.load(f)
+        d["people"].append({"name": name, "email": name + "@co.test", "linux_user": linux_user, "status": status,
+                            "chat_space": space, "chat_user": None, "session_id": None})
+        with open(self.people, "w") as f:
+            json.dump(d, f)
+        open(os.path.join(self.audit, linux_user + ".jsonl"), "w").close()
+
+    def ask(self, text=Q, to="ravi", ask=A1, user="asha"):
+        self.host.outbox.setdefault(user, []).append({"kind": "ask", "to": to, "ask": ask, "text": text, "ts": None})
+        self.b.check_outbox()
+
+    def result(self, ref, text, status, user="ravi"):
+        self.host.outbox.setdefault(user, []).append({"kind": "result", "ref": ref, "status": status, "text": text, "ts": None})
+        self.b.check_outbox()
+
+    def approval_thread(self, ask=A1):
+        return self.state().get(ask)["approval_thread"]
+
+    def received_thread(self, ask=A1):
+        return self.state().get(ask)["received_thread"]
+
+    def say(self, text, thread=None, who="asha", space=None, name=None):
+        space = space or {"asha": DM1, "ravi": DM2, "mira": DM3}[who]
+        self.b.handle_event(classic(text, email=who + "@co.test", space=space, thread=thread, name=name))
+
+    def approve(self, ask=A1):
+        self.say("yes", thread=self.approval_thread(ask))
+
+    def to_person(self, ask=A1, text=Q):
+        """Ask, approve, and have the colleague's agent say it cannot answer."""
+        self.ask(text, ask=ask); self.approve(ask)
+        self.result(ask, "needs a decision from ravi", "cannot")
+        return self.received_thread(ask)
+
+    def inbox(self, ask=A1, user="asha"):
+        return self.host.inbox.get((user, ask))
+
+    def sent_to(self, space):
+        return [s for s in self.chat.sent if s[0] == space]
+
+    def ask_rows(self, user):
+        return [r for r in cb.read_tail(os.path.join(self.audit, user + ".jsonl")) if r["event"] == "ask"]
+
+    def file_text(self, path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def capture(self):
+        records = []
+        h = logging.Handler(); h.emit = records.append
+        lg = logging.getLogger("chat_bridge"); lg.addHandler(h); lg.setLevel(logging.DEBUG)
+        self.addCleanup(lg.removeHandler, h)
+        return records
+
+    # ---- the flow
+    def test_ask_asks_the_asker_for_ok_in_its_own_thread(self):
+        self.ask()
+        self.assertEqual(self.chat.sent, [(DM1, ASK_OK % ("Ravi", Q), DM1 + "/threads/T1")])
+        a = self.state().get(A1)
+        self.assertEqual((a["from"], a["to"], a["status"], a["approval_thread"]), ("asha", "ravi", "awaiting_ok", DM1 + "/threads/T1"))
+        self.assertEqual(self.host.launches(), [])
+        self.assertEqual(self.host.inbox, {})
+
+    def test_yes_starts_a_read_only_answer_run_in_the_colleagues_account(self):
+        self.ask(); self.approve()
+        [(_, user, ref, req)] = self.host.launches()
+        self.assertEqual((user, ref), ("ravi", A1))
+        self.assertEqual(set(req), {"mode", "prompt", "session_uuid", "resume", "ask", "asker"})
+        self.assertEqual((req["mode"], req["prompt"], req["resume"], req["ask"], req["asker"]), ("ask", Q, False, A1, "asha"))
+        self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
+        a = self.state().get(A1)
+        self.assertEqual((a["status"], a["run_status"]), ("asking_agent", "running"))
+        space, text, thread = self.chat.sent[-1]
+        self.assertEqual((space, thread), (DM1, self.approval_thread()))
+        self.assertIn("Ravi", text)
+        self.assertEqual(self.sent_to(DM2), [])                              # Ravi hears nothing unless needed
+        # no free slot: the answer run waits, then starts with the outbox check
+        self.cfg.chat_runs_at_once = 1
+        self.ask(ask=A2); self.approve(A2)
+        self.assertEqual(len(self.host.launches()), 1)
+        self.assertEqual(self.state().get(A2)["run_status"], "queued")
+        self.result(A1, "It is 3.", "answer")
+        self.assertEqual([c[2] for c in self.host.launches()], [A1, A2])
+        self.assertEqual(self.state().get(A2)["run_status"], "running")
+
+    def test_no_and_expiry_reach_the_waiter(self):
+        self.ask(); self.say("no", thread=self.approval_thread())
+        self.assertEqual(self.inbox(), {"ask": A1, "outcome": "declined", "by": None, "from": "ravi",
+                                        "text": "Asha did not approve this question."})
+        self.assertEqual(self.state().get(A1)["status"], "declined")
+        self.assertEqual(self.host.launches(), []); self.assertEqual(self.sent_to(DM2), [])
+        self.assertEqual(self.chat.sent[-1][2], self.approval_thread())
+        self.ask(ask=A2)
+        self.clock[0] += 7200 - 1
+        self.b.check_asks()                                                   # settles A1 (unread: cleaned up)
+        self.assertIsNone(self.inbox(A2))
+        self.assertEqual(self.state().get(A2)["status"], "awaiting_ok")
+        self.clock[0] += 1
+        self.b.check_asks()
+        body = self.inbox(A2)
+        self.assertEqual((body["outcome"], body["from"]), ("expired", "ravi"))
+        self.assertIn("in time", body["text"])
+        self.assertEqual(self.state().get(A2)["status"], "expired")
+        self.approve(A2)                                                      # too late: nothing runs
+        self.assertEqual(self.host.launches(), [])
+        self.assertEqual(self.sent_to(DM2), [])
+
+    def test_yes_in_a_task_thread_or_at_top_level_never_approves(self):
+        self.say("fix the login bug")                                         # task t1 in thread T1
+        self.result("t1", "fixed", "ok", user="asha")
+        self.ask()                                                            # approval in thread T2
+        self.assertEqual(self.approval_thread(), DM1 + "/threads/T2")
+        self.say("yes", thread=DM1 + "/threads/T1")                           # answers the task
+        self.assertEqual([(c[1], c[2], c[3]["prompt"]) for c in self.host.launches()][-1], ("asha", "t1", "yes"))
+        self.say("yes")                                                       # top level: the restart "yes"
+        self.assertIn("Nothing is waiting", self.chat.sent[-1][1])
+        self.say("yes", who="ravi")
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.assertFalse([c for c in self.host.launches() if c[1] == "ravi"])
+
+    def test_auto_answer_goes_to_the_asker_and_a_copy_to_the_colleague(self):
+        self.ask(); self.approve()
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "agent", "from": "ravi",
+                                        "text": "The limit is 3."})
+        self.assertEqual(self.sent_to(DM2), [(DM2, ASK_COPY % ("Asha", Q, "The limit is 3."), DM2 + "/threads/T2")])
+        a = self.state().get(A1)
+        self.assertEqual((a["status"], a["run_status"]), ("answered", "idle"))
+        self.host.inbox.pop(("asha", A1))                                     # the waiter read it
+        self.clock[0] += 121
+        n = len(self.chat.sent)
+        self.b.check_asks()
+        self.assertEqual(len(self.chat.sent), n)                              # read: no DM
+        a = self.state().get(A1)
+        self.assertIsNotNone(a["closed_at"])
+        self.assertNotIn(Q, self.file_text(self.state_file)); self.assertNotIn("The limit is 3.", self.file_text(self.state_file))
+        self.assertEqual(a["status"], "answered")
+
+    def test_cannot_answer_opens_a_thread_for_the_colleague(self):
+        thread = self.to_person()
+        self.assertEqual(self.sent_to(DM2), [(DM2, ASK_TO_PERSON % ("Asha", Q), thread)])
+        a = self.state().get(A1)
+        self.assertEqual((a["status"], a["run_status"]), ("with_person", "idle"))
+        self.assertIsNone(self.inbox())
+        # a failed answer run, one that cannot start and one that never reports all go to the person too
+        self.ask(ask=A2); self.approve(A2); self.result(A2, "the answer run failed (exit 1)", "failed")
+        self.assertEqual(self.state().get(A2)["status"], "with_person")
+        self.host.launch_ok = False
+        self.ask(ask=A3); self.approve(A3)
+        self.assertEqual(self.state().get(A3)["status"], "with_person")
+        self.assertEqual(self.state().get(A3)["run_status"], "idle")
+        self.host.launch_ok = True
+        self.add_person("mira", "mira", DM3)
+        self.ask(ask="a0000000004", to="mira"); self.approve("a0000000004")
+        self.assertEqual(self.state().get("a0000000004")["run_status"], "running")
+        self.clock[0] += 13 * 60
+        self.b.check_outbox()
+        a = self.state().get("a0000000004")
+        self.assertEqual((a["status"], a["run_status"]), ("with_person", "idle"))
+        self.assertEqual(self.state().running(), 0)
+        self.assertEqual(self.sent_to(DM3)[-1][1], ASK_TO_PERSON % ("Asha", Q))
+
+    def test_colleague_reply_is_delivered_as_person(self):
+        thread = self.to_person()
+        self.say("It is 3, see upload/config.py", thread=thread, who="ravi")
+        self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "person", "from": "ravi",
+                                        "text": "It is 3, see upload/config.py"})
+        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertIn("Asha", self.chat.sent[-1][1])
+        self.assertEqual(self.state().get(A1)["status"], "answered")
+        self.assertEqual([c for c in self.host.launches() if c[2].startswith("t")], [])   # not a task for Ravi
+
+    def test_do_it_runs_a_normal_task_and_a_clean_result_is_delivered(self):
+        thread = self.to_person()
+        self.say("do it", thread=thread, who="ravi")
+        _, user, ref, req = self.host.launches()[-1]
+        self.assertEqual((user, ref), ("ravi", D1))
+        self.assertEqual((req["mode"], req["resume"], req["ask"], req["asker"]), ("doit", False, A1, "asha"))
+        self.assertIn(Q, req["prompt"]); self.assertIn("QUESTION", req["prompt"])
+        self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
+        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertEqual(self.state().get(A1)["run_status"], "running")
+        self.result(D1, "Raised it to 5 in PR 9.", "ok")
+        self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "agent", "from": "ravi",
+                                        "text": "Raised it to 5 in PR 9."})
+        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertIn("Raised it to 5 in PR 9.", self.chat.sent[-1][1])
+        self.assertEqual(self.state().get(A1)["run_status"], "idle")
+
+    def test_do_it_needs_you_stays_with_the_colleague(self):
+        thread = self.to_person()
+        self.say("do it", thread=thread, who="ravi")
+        self.result(D1, "Built it.\nNEEDS YOU: approve the deploy", "needs_you")
+        self.assertIsNone(self.inbox())
+        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertIn("approve the deploy", self.chat.sent[-1][1]); self.assertIn("needs you", self.chat.sent[-1][1].lower())
+        self.assertEqual(self.state().get(A1)["status"], "with_person")
+        self.say("do it", thread=thread, who="ravi")                         # again, a fresh run
+        first, second = [c for c in self.host.launches() if c[2] == D1]
+        self.assertNotEqual(first[3]["session_uuid"], second[3]["session_uuid"])
+        self.result(D1, "failed (stopped after 10 minutes)", "failed")
+        self.assertIsNone(self.inbox()); self.assertIn("failed", self.chat.sent[-1][1].lower())
+        self.say("Not today, sorry.", thread=thread, who="ravi")
+        self.assertEqual(self.inbox()["text"], "Not today, sorry.")
+        self.assertEqual(self.inbox()["by"], "person")
+
+    def test_a_queued_do_it_never_starts_once_the_colleague_answered(self):
+        thread = self.to_person()
+        self.cfg.chat_runs_at_once = 0
+        self.say("do it", thread=thread, who="ravi")
+        self.assertEqual(self.state().get(A1)["run_status"], "queued")
+        self.say("No, leave it as it is.", thread=thread, who="ravi")        # answered by hand while it waits
+        self.cfg.chat_runs_at_once = 2
+        self.b.check_outbox()
+        self.assertFalse([c for c in self.host.launches() if c[2] == D1])
+        self.assertEqual(self.state().get(A1)["run_status"], "idle")
+        self.host.inbox.clear(); self.clock[0] += 121; self.b.check_asks()
+        self.assertNotIn(Q, self.file_text(self.state_file))
+
+    def test_only_the_colleagues_own_thread_can_answer(self):
+        thread = self.to_person()
+        self.add_person("mira", "mira", DM3)
+        self.say("It is 7", thread=thread, who="mira")                        # another person, same thread name
+        self.say("It is 8", thread=thread, who="asha")                        # the asker herself
+        self.say("It is 9", who="ravi")                                       # Ravi, but not in that thread
+        self.say("It is 10", thread=DM2 + "/threads/T99", who="ravi")         # Ravi, another thread
+        self.say("It is 11", thread=thread, who="ravi", space="spaces/DM9")   # Ravi's thread name from another space
+        self.assertIsNone(self.inbox())
+        self.assertEqual(self.state().get(A1)["status"], "with_person")
+        # and the approval thread is Asha's alone
+        self.ask(ask=A2)
+        self.say("yes", thread=self.approval_thread(A2), who="ravi")
+        self.say("yes", thread=self.approval_thread(A2), who="mira")
+        self.assertEqual(self.state().get(A2)["status"], "awaiting_ok")
+        self.assertFalse([c for c in self.host.launches() if c[2] == A2])
+
+    def test_a_result_from_anyone_but_the_colleague_is_dropped(self):
+        records = self.capture()
+        self.ask(); self.approve()
+        self.result(A1, "forged answer", "answer", user="asha")              # the asker's own outbox
+        self.add_person("mira", "mira", DM3)
+        self.result(A1, "forged answer", "answer", user="mira")              # a third person
+        self.assertIsNone(self.inbox())
+        self.assertEqual(self.state().get(A1)["run_status"], "running")
+        self.result(A1, "cannot say", "cannot")                               # the real one
+        self.result(A1, "a second result for a run that ended", "answer")
+        self.assertIsNone(self.inbox())
+        self.say("do it", thread=self.received_thread(), who="ravi")
+        self.result(D1, "forged do-it", "ok", user="asha")
+        self.assertIsNone(self.inbox())
+        self.assertFalse([r for r in records if "forged" in r.getMessage()])
+        self.assertTrue([r for r in records if A1 in r.getMessage() and "dropped" in r.getMessage()])
+
+    def test_unread_answer_falls_back_to_the_askers_dm(self):
+        self.ask(); self.approve(); self.result(A1, "The limit is 3.", "answer")
+        self.clock[0] += 119
+        self.assertEqual(self.b.check_asks(), 0)
+        self.assertIsNotNone(self.inbox())
+        self.clock[0] += 2
+        self.assertEqual(self.b.check_asks(), 1)
+        self.assertIsNone(self.inbox())
+        self.assertIn(("remove_inbox", "asha", A1), self.host.calls)
+        self.assertEqual(self.chat.sent[-1], (DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")))
+        self.assertIsNotNone(self.state().get(A1)["closed_at"])
+        n = len(self.chat.sent)
+        self.clock[0] += 600
+        self.b.check_asks()
+        self.assertEqual(len(self.chat.sent), n)                              # once
+        # an inbox that cannot be written goes to the DM at once
+        self.host.inbox_fail = True
+        thread = self.to_person(ask=A2)
+        self.say("It is 3.", thread=thread, who="ravi")
+        self.assertEqual(self.chat.sent[-2], (DM1, ASK_DM % ("Ravi", Q, "It is 3.")))
+        self.assertIsNotNone(self.state().get(A2)["closed_at"])
+        # a declined or expired question left unread is only cleaned up, never DMed
+        self.host.inbox_fail = False
+        self.ask(ask=A3); self.say("no", thread=self.approval_thread(A3))
+        n = len(self.chat.sent)
+        self.clock[0] += 121
+        self.b.check_asks()
+        self.assertIsNone(self.inbox(A3)); self.assertEqual(len(self.chat.sent), n)
+        self.assertIsNotNone(self.state().get(A3)["closed_at"])
+
+    def test_self_unknown_and_inactive_names_are_refused(self):
+        self.add_person("mira", "mlinux", DM3)                               # a name that is not the Linux user
+        cases = [("asha", A1, "asha", "yourself"), ("nobody", A2, "asha", "no colleague called nobody"),
+                 ("self", A3, "asha", "no colleague called self"), ("root", "a0000000004", "asha", "no colleague called root"),
+                 ("mlinux", "a0000000005", "asha", "no colleague called mlinux"),
+                 ("mira", "a0000000006", "mlinux", "yourself")]
+        for to, ask, user, why in cases:
+            self.ask(to=to, ask=ask, user=user)
+            body = self.host.inbox.get((user, ask))
+            self.assertEqual((body["ask"], body["outcome"], body["from"]), (ask, "refused", to), to)
+            self.assertIn(why, body["text"].lower(), to)
+            self.assertIsNone(self.state().get(ask), to)
+        self.store.update("ravi", status="pending")
+        self.ask(ask="a0000000007")
+        body = self.inbox("a0000000007")
+        self.assertEqual(body["outcome"], "refused"); self.assertIn("Ravi", body["text"])
+        self.assertEqual(self.chat.sent, []); self.assertEqual(self.host.launches(), [])
+        self.assertEqual(self.ask_rows("asha") + self.ask_rows("ravi") + self.ask_rows("mlinux"), [])
+        self.ask(to="mira", ask="a0000000008")                                # by name: fine
+        self.assertEqual(self.state().get("a0000000008")["to"], "mlinux")
+        self.assertEqual(self.chat.sent[-1][1], ASK_OK % ("Mira", Q))
+
+    def test_redelivered_yes_answer_or_do_it_acts_once(self):
+        self.ask()
+        yes = classic("yes", thread=self.approval_thread(), name="spaces/DM1/messages/Y1")
+        self.b.handle_event(yes); self.b.handle_event(yes)
+        b2 = cb.Bridge(self.cfg, cb.PeopleStore(self.people), self.chat, self.host, now=lambda: self.clock[0])
+        b2.handle_event(yes)                                                  # after a restart: no memory of Y1
+        self.assertEqual(len(self.host.launches()), 1)
+        self.result(A1, "cannot tell", "cannot")
+        thread = self.received_thread()
+        doit = classic("do it", email="ravi@co.test", space=DM2, thread=thread, name="spaces/DM2/messages/D1")
+        self.b.handle_event(doit); self.b.handle_event(doit); b2.handle_event(doit)
+        self.assertEqual(len([c for c in self.host.launches() if c[2] == D1]), 1)
+        self.result(D1, "Done: PR 9.", "ok")
+        self.assertEqual(len(self.host.inbox_writes), 1)
+        answer = classic("It is 3", email="ravi@co.test", space=DM2, thread=thread, name="spaces/DM2/messages/R1")
+        self.b.handle_event(answer); b2.handle_event(answer)
+        self.assertEqual(len(self.host.inbox_writes), 1)
+        self.host.inbox.clear(); self.clock[0] += 121; self.b.check_asks()   # closed
+        b3 = cb.Bridge(self.cfg, cb.PeopleStore(self.people), self.chat, self.host, now=lambda: self.clock[0])
+        b3.handle_event(yes); b3.handle_event(answer); b3.handle_event(doit)
+        self.assertEqual(len(self.host.launches()), 2)                       # no task started from a closed thread
+        self.assertEqual(len(self.host.inbox_writes), 1)
+
+    def test_secret_question_or_answer_is_refused_and_never_logged(self):
+        with self.assertLogs("chat_bridge", level="DEBUG") as logs:
+            self.ask("use " + GH_TOKEN + " to check")
+            self.assertEqual(self.inbox()["outcome"], "refused")
+            self.assertEqual(self.chat.sent, []); self.assertIsNone(self.state().get(A1))
+            self.ask(ask=A2); self.approve(A2)
+            self.result(A2, "The token is " + GH_TOKEN, "answer")             # an auto-answer with a secret
+            self.assertIsNone(self.inbox(A2))
+            self.assertEqual(self.state().get(A2)["status"], "with_person")
+            thread = self.received_thread(A2)
+            self.say("here: " + GH_TOKEN, thread=thread, who="ravi")           # the person's answer
+            self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it.", thread))
+            self.assertIsNone(self.inbox(A2))
+            self.say("do it", thread=thread, who="ravi")
+            self.result("d0000000002", "Found it: " + GH_TOKEN, "ok")          # a do-it result
+            self.assertIsNone(self.inbox(A2))
+            self.assertEqual(self.state().get(A2)["status"], "with_person")
+        audit = self.file_text(os.path.join(self.audit, "asha.jsonl")) + self.file_text(os.path.join(self.audit, "ravi.jsonl"))
+        wheres = [r["where"] for u in ("asha", "ravi") for r in cb.read_tail(os.path.join(self.audit, u + ".jsonl"))
+                  if r["event"] == "secret_blocked"]
+        self.assertIn("ask", wheres); self.assertIn("answer", wheres)
+        for where in [s[1] for s in self.chat.sent] + [audit, self.file_text(self.state_file)] + logs.output + \
+                [json.dumps(b) for b in self.host.inbox.values()]:
+            self.assertNotIn(GH_TOKEN, where)
+
+    def test_ask_limits(self):
+        self.cfg.asks_per_day = 2
+        self.ask(ask=A1); self.ask(ask=A2); self.ask(ask=A3)
+        self.assertEqual(self.inbox(A3)["outcome"], "limit")
+        self.assertIsNone(self.state().get(A3))
+        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("Your agent wants to ask")]), 2)
+        self.cfg.asks_per_day = 10; self.cfg.asks_received_per_day = 1
+        self.approve(A1)                                                      # Ravi has had one today
+        self.add_person("mira", "mira", DM3)
+        self.ask(ask="a0000000004", user="mira")
+        self.assertEqual(self.host.inbox[("mira", "a0000000004")]["outcome"], "limit")
+        self.assertIn("Ravi", self.host.inbox[("mira", "a0000000004")]["text"])
+
+    def test_audit_rows_in_both_files_without_text(self):
+        self.add_person("mira", "mlinux", DM3)
+        records = self.capture()
+        answer = "Use the v2 endpoint."
+        self.ask(to="mira"); self.approve(); self.result(A1, "not sure", "cannot", user="mlinux")
+        thread = self.received_thread()
+        self.say("do it", thread=thread, who="mira")
+        self.result(D1, "Built.\nNEEDS YOU: decide", "needs_you", user="mlinux")
+        self.say(answer, thread=thread, who="mira")
+        self.clock[0] += 121; self.b.check_asks()                             # unread: DMed
+        phases = ["requested", "approved", "to_person", "do_it", "answered", "delivered", "dm_fallback"]
+        for user in ("asha", "mlinux"):
+            rows = self.ask_rows(user)
+            self.assertEqual([r["phase"] for r in rows], phases, user)
+            for r in rows:
+                self.assertEqual(set(r), {"ts", "user", "event", "ask", "from", "to", "chars", "phase"})
+                self.assertEqual((r["ask"], r["from"], r["to"]), (A1, "asha", "mira"))
+        self.assertEqual([r["chars"] for r in self.ask_rows("asha")][:2], [len(Q), len(Q)])
+        self.assertEqual([r["chars"] for r in self.ask_rows("asha")][4], len(answer))
+        self.ask(ask=A2); self.say("no", thread=self.approval_thread(A2))
+        self.ask(ask=A3); self.clock[0] += 7200; self.b.check_asks()
+        self.ask(ask="a0000000004"); self.approve("a0000000004"); self.result("a0000000004", "Yes.", "answer")
+        self.assertEqual([r["phase"] for r in self.ask_rows("ravi")],
+                         ["requested", "declined", "delivered", "requested", "expired", "delivered",
+                          "requested", "approved", "auto_answered", "delivered"])
+        texts = [Q, answer, "not sure", "NEEDS YOU: decide", "Yes."]
+        for t in texts:
+            for where in [self.file_text(os.path.join(self.audit, u + ".jsonl")) for u in ("asha", "ravi", "mlinux")] + \
+                    [r.getMessage() for r in records]:
+                self.assertNotIn(t, where)
+
+
+class TestSystemHostInbox(unittest.TestCase):
+    def test_inbox_write_check_and_remove_in_the_askers_home(self):
+        import types
+        from unittest import mock
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        pw = types.SimpleNamespace(pw_dir=tmp.name, pw_uid=os.getuid(), pw_gid=os.getgid())
+        body = {"ask": A1, "outcome": "answered", "by": "agent", "from": "ravi", "text": "3"}
+        path = os.path.join(tmp.name, ".claude", "inbox", A1 + ".json")
+        with mock.patch("pwd.getpwnam", return_value=pw):
+            h = cb.SystemHost()
+            h.write_inbox("asha", A1, body)
+            with open(path) as f:
+                self.assertEqual(json.load(f), body)
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+            self.assertFalse(h.inbox_taken("asha", A1))
+            h.remove_inbox("asha", A1)
+            self.assertTrue(h.inbox_taken("asha", A1))
+            with self.assertRaises(ValueError):
+                h.write_inbox("asha", "../x", body)
 
 
 class TestSystemHostLaunchRun(unittest.TestCase):

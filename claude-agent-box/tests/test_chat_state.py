@@ -69,6 +69,14 @@ class TestChatState(Base):
         self.st.tasks("asha")[0]["status"] = "changed"            # a copy: the file is untouched
         self.assertEqual(self.st.get("t1")["status"], "running")
 
+    def test_asks_lists_copies_oldest_first_closed_ones_included(self):
+        self.st.new_ask("asha", "ravi", "q1", "a0000000001"); self.st.new_ask("ravi", "asha", "q2", "a0000000002")
+        self.st.close("a0000000001")
+        self.assertEqual([a["ask"] for a in self.st.asks()], ["a0000000001", "a0000000002"])
+        self.assertIsNotNone(self.st.asks()[0]["closed_at"])
+        self.st.asks()[1]["status"] = "changed"                   # a copy: the file is untouched
+        self.assertEqual(self.st.get("a0000000002")["status"], "awaiting_ok")
+
     def test_newest_20_tasks_kept_per_user(self):
         for i in range(25):
             self.st.new_task("asha", "T%d" % i, "u%d" % i)

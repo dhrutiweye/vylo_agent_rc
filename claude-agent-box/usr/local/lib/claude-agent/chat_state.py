@@ -138,6 +138,10 @@ class ChatState:
         """Copies of the kept tasks, oldest first; only `user`'s when given."""
         return [dict(t) for t in self._read()["tasks"] if user is None or t["user"] == user]
 
+    def asks(self):
+        """Copies of the kept asks, oldest first, closed ones included (the bridge's expiry and DM-fallback sweep)."""
+        return [dict(a) for a in self._read()["asks"]]
+
     def item_by_thread(self, user, thread):
         if not thread:
             return None

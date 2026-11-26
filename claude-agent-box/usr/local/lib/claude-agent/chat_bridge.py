@@ -20,6 +20,14 @@ agent-chat-exec as that person in a capped systemd unit (Host.launch_run). The r
 outbox (kind "result", its ref) and is posted in the task's thread; a reply in that thread resumes the same headless
 conversation. Task state lives on disk (chat_state.py), so a result still finds its thread after a bridge restart.
 
+Asking a colleague: an agent's ask-colleague leaves {"kind": "ask", "to": NAME, ...} in its outbox. The bridge checks
+NAME against people.json (not yourself, known, active), the daily limits and the secret check, then asks the asker's
+person for a yes in a new thread of its own. A yes starts a read-only answer run in the colleague's account (ref = the
+ask id); "answer" goes back at once, anything else opens a thread for the colleague, who answers there or says "do
+it" (a normal run, ref "d" + id[1:]). The answer is written to the asker's ~/.claude/inbox/<ask>.json, where the
+waiting ask-colleague picks it up; check_asks DMs it to the asker if nobody read it within ASK_DM_FALLBACK_SECONDS,
+expires unapproved questions and prunes old ones. Every step is audited (metadata only) in both people's files.
+
 Events arrive on a Cloud Pub/Sub pull subscription (no inbound port); replies go out through the Chat
 REST API with the service-account key. All outside effects sit behind three small interfaces so the
 logic is tested with fakes (tests/test_chat_bridge.py):
@@ -28,7 +36,8 @@ logic is tested with fakes (tests/test_chat_bridge.py):
     Chat         send(space, text, thread=None, new_thread=False) -> thread name
     Host         start_login / send_code / wait_login_ok / stop_login / start_agent /
                  wait_session_id / service_active / session_id / take_outbox /
-                 new_session / switch_session / agent_job / launch_run
+                 new_session / switch_session / agent_job / launch_run /
+                 write_inbox / inbox_taken / remove_inbox
 
 Config: environment (systemd EnvironmentFile=/etc/claude-agent/bridge.env). No secrets in code.
 Pasted sign-in codes and message text are never logged.
@@ -95,6 +104,25 @@ TOO_LONG = "That's too long for one message (%d characters max)." % TASK_MAX_CHA
 SECRET_REFUSED = "That looks like a secret, so I did not send it."
 STILL_LAST_MESSAGE = "Still working on the last message; send it again when I answer."
 RESULTS_HINT = "ask your agent to show ~/.claude/chat-results/%s.txt"
+NO_WORDS = {"no", "n"}
+DO_IT_WORDS = {"do it", "do it.", "do it!", "doit"}
+INBOX_CHARS = 2000            # an answer in the asker's inbox: JSON-escaped non-ASCII must stay under read_inbox's 16 KB
+ASK_OK = "Your agent wants to ask %s: «%s». Reply yes in this thread to send it, or no."
+ASK_SENT = "Sent to %s. Their agent tries to answer first; the answer goes back to your agent."
+ASK_TO_PERSON = "%s's agent asks: «%s». Reply in this thread to answer, or say do it to have your agent do it."
+ASK_COPY = "Your agent answered %s's agent. Q: %s A: %s"
+ASK_DM = "%s answered your agent's question «%s»: %s"
+ASK_DECIDED = "That question is already decided."
+ASK_CLOSED = "That question is closed."
+DOIT_PROMPT = ("%s's agent asked you the question below, and %s told you to act on it (\"do it\").\n"
+               "<<<QUESTION\n%s\nQUESTION>>>\n"
+               "Do what it asks if it is reasonable and safe, then end with the answer to send back to %s's agent.")
+
+
+def shown(name):
+    """A person's name as a message shows it: ravi -> Ravi."""
+    name = str(name or "")
+    return name[:1].upper() + name[1:]
 
 
 # ------------------------------------------------------------------ config
@@ -388,6 +416,11 @@ class Bridge:
             found = self.state.item_by_thread(user, m["thread"])
             if found and self._on_thread(person, m["space"], found, text):
                 self.pending.pop(user, None)
+                return
+            if not found and self._closed_ask_thread(user, m["thread"]):
+                self.pending.pop(user, None)                # a late yes/answer/"do it": never a command or a task
+                if text.strip():
+                    self._reply(m["space"], ASK_CLOSED, m["thread"])
                 return
         if low in YES_WORDS:
             self.on_yes(person, m["space"])
@@ -857,9 +890,18 @@ class Bridge:
         return self._on_ask_thread(person, space, role, item, text)
 
     def _on_ask_thread(self, person, space, role, item, text):
-        """Task 7: a yes/no in an ask's approval thread, or a colleague's answer / "do it" in a received ask's thread.
-        Not built yet: returning False lets the message fall through to the commands and new-task routing."""
-        return False
+        """A yes/no in an ask's approval thread (the asker's person), or the colleague's answer / "do it" in the thread
+        of an ask they received. Always True: a message in an ask's thread is never a command or a task."""
+        user, ask_id = person["linux_user"], item["ask"]
+        thread = item.get("approval_thread" if role == "approval" else "received_thread") or ""
+        if not thread.startswith(space + "/"):              # only the person's own DM space counts
+            log.warning("ignored a message for ask %s from %s: not in their own DM", ask_id, user)
+            return True
+        if role == "approval":
+            self._on_approval(space, ask_id, thread, text)
+        else:
+            self._on_received(person, space, ask_id, thread, text)
+        return True
 
     def _usable_text(self, user, space, text, thread=None):
         """The task text, or None when it must not be run (blank: ignored; too long or a secret: refused)."""
@@ -994,18 +1036,374 @@ class Bridge:
             return False
         return True
 
-    def _on_ask_result(self, p, msg):
-        """Task 7: the result of an ask's answer run (a…) or a do-it run (d…). Not built yet: dropped by ref."""
-        log.info("dropped a result for %s from %s: ask results arrive with the ask flow", msg["ref"], p["linux_user"])
-        return False
+    # ---- asking a colleague (design §2). An ask goes awaiting_ok -> asking_agent -> with_person -> answered |
+    # declined | expired; "done" is closed_at, set once the answer was read or DMed. The state keeps the linux users
+    # in from/to and the people names in from_name/to_name. Message text is never logged or audited.
+    def _audit_ask(self, ask, phase, chars):
+        """One metadata row in BOTH people's audit files."""
+        names = {"from": ask.get("from_name") or ask["from"], "to": ask.get("to_name") or ask["to"]}
+        for user in (ask["from"], ask["to"]):
+            self._audit(user, "ask", ask=ask["ask"], chars=chars, phase=phase, **names)
+
+    @staticmethod
+    def _inbox_body(ask_id, outcome, colleague, text, by=None):
+        """What ask-colleague reads from ~/.claude/inbox/<ask>.json."""
+        text = text if len(text) <= INBOX_CHARS else text[:INBOX_CHARS].rstrip() + "\n… (cut)"
+        return {"ask": ask_id, "outcome": outcome, "by": by, "from": colleague, "text": text}
+
+    def _refuse_ask(self, user, ask_id, name, outcome, why):
+        """Straight back to the waiter (refused / limit): no state row, nothing posted to anyone."""
+        log.info("ask %s from %s: %s", ask_id, user, outcome)
+        try:
+            self.host.write_inbox(user, ask_id, self._inbox_body(ask_id, outcome, name, why))
+        except Exception as e:                             # noqa: BLE001 - the waiter then times out; nothing leaks
+            log.warning("could not answer ask %s for %s: %s", ask_id, user, e.__class__.__name__)
 
     def _on_outbox_ask(self, p, msg):
-        """Task 7: a question p's agent wants to ask a colleague. Not built yet: dropped by id."""
-        log.info("dropped ask %s from %s: asking colleagues is not switched on yet", msg.get("ask"), p["linux_user"])
+        """A question p's agent wants to ask colleague msg["to"] (a people name). The sender is p, whose home it was."""
+        user, ask_id, name, text = p["linux_user"], msg["ask"], msg["to"], msg["text"]
+        if self.state.get(ask_id) is not None:
+            log.warning("dropped ask %s from %s: that id is already taken", ask_id, user)
+            return
+        target = self.store.get(name)
+        if target is None:
+            return self._refuse_ask(user, ask_id, name, "refused", "There is no colleague called %s on the box." % name)
+        if target.get("linux_user") == user:
+            return self._refuse_ask(user, ask_id, name, "refused", "You cannot ask yourself; ask a colleague by name.")
+        if target.get("status") != "active" or not target.get("chat_space"):
+            return self._refuse_ask(user, ask_id, name, "refused",
+                                    "%s has not set up their agent yet, so they cannot be asked." % shown(name))
+        if self.state.count_today("ask_sent", user) >= self.cfg.asks_per_day:
+            return self._refuse_ask(user, ask_id, name, "limit", "Limit reached: your agent has asked %d questions "
+                                                                 "today." % self.cfg.asks_per_day)
+        if self.state.count_today("ask_received", target["linux_user"]) >= self.cfg.asks_received_per_day:
+            return self._refuse_ask(user, ask_id, name, "limit", "Limit reached: %s has had %d questions today."
+                                    % (shown(name), self.cfg.asks_received_per_day))
+        if looks_secret(text):
+            log.info("refused ask %s from %s: it looks like a secret (where=ask)", ask_id, user)
+            self._audit(user, "secret_blocked", where="ask")
+            return self._refuse_ask(user, ask_id, name, "refused", SECRET_REFUSED)
+        self.state.new_ask(user, target["linux_user"], text, ask_id)
+        ask = self.state.update(ask_id, from_name=p["name"], to_name=target["name"])
+        self._audit_ask(ask, "requested", len(text))
+        try:
+            thread = self.chat.send(p["chat_space"], ASK_OK % (shown(target["name"]), text), new_thread=True)
+        except Exception as e:                             # noqa: BLE001
+            log.warning("could not ask %s to approve ask %s: %s", user, ask_id, e.__class__.__name__)
+            self.state.close(ask_id)                       # stays awaiting_ok: never counted as the colleague's
+            self._refuse_ask(user, ask_id, target["name"], "refused", "I could not reach your user in Chat just now.")
+            return
+        self.state.update(ask_id, approval_thread=thread)
+        log.info("ask %s from %s to %s waits for approval", ask_id, user, target["linux_user"])
+
+    def _open_ask(self, ask_id, status):
+        """The ask, read fresh, when it is open and in `status`; else None."""
+        ask = self.state.get(ask_id)
+        if not ask or ask.get("closed_at") is not None or ask.get("status") != status:
+            return None
+        return ask
+
+    def _on_approval(self, space, ask_id, thread, text):
+        low = (text or "").strip().lower()
+        if not low:
+            return
+        with self.run_lock:
+            ask = self._open_ask(ask_id, "awaiting_ok")
+            if ask is None:                                # decided already (or a redelivery after a restart)
+                self._reply(space, ASK_DECIDED, thread)
+                return
+            if low in NO_WORDS:
+                self.state.update(ask_id, status="declined")
+                self._audit_ask(ask, "declined", len(ask["text"]))
+                self._deliver(ask, "declined", "%s did not approve this question." % shown(ask["from_name"]))
+                self._reply(space, "OK, not sent.", thread)
+                return
+            if low not in YES_WORDS:
+                self._reply(space, "Reply yes or no here.", thread)
+                return
+            self.state.update(ask_id, status="asking_agent")
+            self._audit_ask(ask, "approved", len(ask["text"]))
+            self._reply(space, ASK_SENT % shown(ask["to_name"]), thread)
+            request = {"mode": "ask", "prompt": ask["text"], "session_uuid": str(uuid.uuid4()), "resume": False,
+                       "ask": ask_id, "asker": ask["from_name"]}
+            self._start_ask_run(ask_id, ask_id, request)
+
+    def _on_received(self, person, space, ask_id, thread, text):
+        """The colleague, in the thread of a question they were handed: their answer, or "do it"."""
+        user, body = person["linux_user"], (text or "").strip()
+        if not body:
+            return
+        with self.run_lock:
+            ask = self._open_ask(ask_id, "with_person")
+            if ask is None:
+                self._reply(space, "That question is already answered.", thread)
+                return
+            if len(body) > TASK_MAX_CHARS:
+                self._reply(space, TOO_LONG, thread)
+                return
+            if body.lower() in DO_IT_WORDS:
+                if ask.get("run_status") in RUN_BUSY:
+                    self._reply(space, "Your agent is already on it.", thread)
+                    return
+                request = {"mode": "doit", "session_uuid": str(uuid.uuid4()), "resume": False, "ask": ask_id,
+                           "asker": ask["from_name"], "prompt": DOIT_PROMPT % (
+                               shown(ask["from_name"]), shown(ask["to_name"]), ask["text"], shown(ask["from_name"]))}
+                started = self._start_ask_run(ask_id, "d" + ask_id[1:], request)
+                if started:
+                    self._audit_ask(ask, "do_it", len(ask["text"]))
+                    self._reply(space, "On it. I'll post the result here." if started is True
+                                else "Got it." + QUEUED_NOTE, thread)
+                return
+            if looks_secret(body):
+                log.info("refused an answer to ask %s from %s: it looks like a secret (where=answer)", ask_id, user)
+                self._audit(user, "secret_blocked", where="answer")
+                self._reply(space, SECRET_REFUSED, thread)
+                return
+            self._audit_ask(ask, "answered", len(body))
+            self._deliver(ask, "answered", body, by="person")
+            self._reply(space, "Sent to %s." % shown(ask["from_name"]), thread)
+
+    def _start_ask_run(self, ask_id, ref, request):
+        """An ask's answer run (ref a…) or do-it run (d…) in the colleague's account. True started, "queued" waiting for
+        a box slot, False could not start (already handled). Called under run_lock."""
+        if self.state.running() >= self.cfg.chat_runs_at_once:
+            self.state.update(ask_id, run_status="queued", run_ref=ref, request=request, last_at=self.now())
+            log.info("ask run %s waits for a free slot", ref)
+            return "queued"
+        return self._launch_ask(ask_id, ref, request)
+
+    def _launch_ask(self, ask_id, ref, request):
+        ask = self.state.get(ask_id)
+        ok = False
+        try:
+            ok = bool(self.host.launch_run(ask["to"], ref, request))
+        except Exception:                                  # noqa: BLE001 - a failed start is handled, never fatal
+            log.exception("could not start ask run %s for %s", ref, ask["to"])
+        if ok:
+            self.state.update(ask_id, run_status="running", run_ref=ref, request=None, last_at=self.now())
+            log.info("ask run %s started for %s", ref, ask["to"])
+            return True
+        self.state.update(ask_id, run_status="idle", run_ref=None, request=None, last_at=self.now())
+        if ref.startswith("a"):                            # the agent cannot try: the person decides
+            self._hand_to_person(ask_id)
+        else:
+            self._post_received(ask, "I couldn't start your agent just now. Say do it again in a minute, or answer "
+                                     "here yourself.")
+        return False
+
+    def _post_received(self, ask, text):
+        """Post in the thread of the ask the colleague received."""
+        colleague = self._person_of(ask["to"])
+        if not colleague or not colleague.get("chat_space"):
+            return False
+        try:
+            self._reply(colleague["chat_space"], text, ask.get("received_thread"))
+            return True
+        except Exception as e:                             # noqa: BLE001
+            log.warning("could not post to %s about ask %s: %s", ask["to"], ask["ask"], e.__class__.__name__)
+            return False
+
+    def _hand_to_person(self, ask_id, note=""):
+        """The colleague's agent could not answer: open a thread for the colleague. Retried by check_asks when the
+        post fails. Called under run_lock (or from check_asks)."""
+        ask = self.state.update(ask_id, status="with_person", run_status="idle")
+        colleague = self._person_of(ask["to"])
+        if not colleague or not colleague.get("chat_space"):
+            log.warning("ask %s: %s cannot be reached in Chat", ask_id, ask["to"])
+            return
+        try:
+            thread = self.chat.send(colleague["chat_space"], ASK_TO_PERSON % (shown(ask["from_name"]), ask["text"])
+                                    + note, new_thread=True)
+        except Exception as e:                             # noqa: BLE001
+            log.warning("could not hand ask %s to %s: %s", ask_id, ask["to"], e.__class__.__name__)
+            return
+        self.state.update(ask_id, received_thread=thread, handed_at=self.now())
+        self._audit_ask(ask, "to_person", len(ask["text"]))
+
+    def _deliver(self, ask, outcome, text, by=None):
+        """Write the outcome to the asker's inbox, where the waiting ask-colleague picks it up. check_asks DMs an
+        unread answer (and cleans up any unread outcome) after ASK_DM_FALLBACK_SECONDS, then closes the ask."""
+        ask_id = ask["ask"]
+        body = self._inbox_body(ask_id, outcome, ask["to_name"], text, by)
+        fields = {"status": outcome, "outcome": outcome, "by": by, "delivered_at": self.now(),
+                  "answer": body["text"] if outcome == "answered" else None}   # for the DM; dropped on close
+        if self.state.get(ask_id).get("run_status") == "queued":   # a waiting run for a decided question never starts
+            fields.update(run_status="idle", run_ref=None, request=None)
+        try:
+            self.host.write_inbox(ask["from"], ask_id, body)
+            written = True
+        except Exception as e:                             # noqa: BLE001
+            log.warning("could not write the answer to ask %s for %s: %s", ask_id, ask["from"], e.__class__.__name__)
+            written = False
+        ask = self.state.update(ask_id, **fields)
+        if written:
+            self._audit_ask(ask, "delivered", len(body["text"]))
+        else:
+            self._settle(ask, unread=True)                 # no inbox file: straight to the DM
+
+    def _settle(self, ask, unread=None):
+        """End of delivery: an answer nobody picked up goes to the asker's DM; any unread file is removed; the ask is
+        closed (text and answer dropped). False when the DM could not be posted (tried again next time)."""
+        ask_id, user = ask["ask"], ask["from"]
+        if unread is None:
+            try:
+                unread = bool(ask.get("inbox_removed")) or not self.host.inbox_taken(user, ask_id)
+            except Exception:                              # noqa: BLE001 - cannot tell: the DM is the safe side
+                unread = True
+        if unread:
+            try:
+                self.host.remove_inbox(user, ask_id)
+                self.state.update(ask_id, inbox_removed=True)
+            except Exception as e:                         # noqa: BLE001
+                log.warning("could not remove the unread answer to ask %s for %s: %s", ask_id, user, e.__class__.__name__)
+            if ask.get("outcome") == "answered":
+                p = self._person_of(user)
+                who = shown(ask["to_name"]) + ("'s agent" if ask.get("by") == "agent" else "")
+                answer = ask.get("answer") or ""
+                if not p or not p.get("chat_space"):
+                    log.warning("ask %s: %s cannot be reached in Chat; the answer is dropped", ask_id, user)
+                else:
+                    try:
+                        self.chat.send(p["chat_space"], ASK_DM % (who, short_text(ask.get("text") or "", 100), answer))
+                    except Exception as e:                 # noqa: BLE001
+                        log.warning("could not DM the answer to ask %s to %s: %s", ask_id, user, e.__class__.__name__)
+                        return False
+                    self._audit_ask(ask, "dm_fallback", len(answer))
+        self.state.update(ask_id, answer=None)
+        self.state.close(ask_id)
+        log.info("ask %s closed", ask_id)
+        return True
+
+    def _on_ask_result(self, p, msg):
+        """The result of an ask's answer run (a…) or do-it run (d…, ruling R2: "d" + ask id[1:]). Accepted only from
+        the outbox of the colleague the ask went TO, while that run is going; anything else is dropped by ref."""
+        user, ref = p["linux_user"], msg["ref"]
+        ask_id = "a" + ref[1:]
+        with self.run_lock:
+            ask = self.state.get(ask_id)
+            if not ask or ask.get("to") != user:
+                log.warning("dropped a result for %s from %s: not an ask they were sent", ref, user)
+                return False
+            if ask.get("run_status") != "running" or ask.get("run_ref") != ref:
+                log.warning("dropped a result for %s from %s: no run of it is going", ref, user)
+                return False
+            ask = self.state.update(ask_id, run_status="idle", run_ref=None, last_at=self.now())
+            if ref.startswith("a"):
+                return self._on_answer_run(ask, msg["status"], msg["text"])
+            return self._on_doit_run(ask, ref, msg["status"], msg["text"])
+
+    def _on_answer_run(self, ask, status, text):
+        if ask.get("status") != "asking_agent" or ask.get("closed_at") is not None:
+            return False
+        if status != "answer":                             # cannot, failed or anything off-mode: the person decides
+            self._hand_to_person(ask["ask"])
+            return True
+        if looks_secret(text):
+            log.info("did not send the answer to ask %s: it looks like a secret (where=answer)", ask["ask"])
+            self._audit(ask["to"], "secret_blocked", where="answer")
+            self._hand_to_person(ask["ask"], " (Your agent's answer looked like it held a secret, so I did not send it.)")
+            return True
+        self._audit_ask(ask, "auto_answered", len(text))
+        self._deliver(ask, "answered", text, by="agent")
+        limit = self.cfg.chat_result_chars
+        copy = text if len(text) <= limit else text[:limit].rstrip() + "…"
+        colleague = self._person_of(ask["to"])
+        if colleague and colleague.get("chat_space"):
+            try:
+                self.chat.send(colleague["chat_space"], ASK_COPY % (shown(ask["from_name"]), ask["text"], copy),
+                               new_thread=True)
+            except Exception as e:                         # noqa: BLE001
+                log.warning("could not copy the answer to ask %s to %s: %s", ask["ask"], ask["to"], e.__class__.__name__)
+        return True
+
+    def _on_doit_run(self, ask, ref, status, text):
+        """Posted in the colleague's thread; only a clean result of a still-open ask goes to the asker."""
+        if status not in ("ok", "needs_you", "failed"):
+            status = "failed"
+        open_ = ask.get("status") == "with_person" and ask.get("closed_at") is None
+        again = " Nothing was sent to %s. Reply here to answer, or say do it again." % shown(ask["from_name"])
+        limit = self.cfg.chat_result_chars
+        if looks_secret(text):
+            log.info("did not post or send the result of %s: it looks like a secret (where=answer)", ref)
+            self._audit(ask["to"], "secret_blocked", where="answer")
+            post = "Your agent finished, but its answer looks like it holds a secret, so I did not post it. To read " \
+                   "it, %s." % (RESULTS_HINT % ref) + (again if open_ else "")
+            send = False
+        else:
+            body = text if len(text) <= limit else text[:limit].rstrip() + "\n… full result: " + RESULTS_HINT % ref
+            send = status == "ok" and open_
+            if status == "ok":
+                post = body + ("\n(Sent to %s.)" % shown(ask["from_name"]) if send else "")
+            else:
+                post = ("Your agent needs you:\n%s" if status == "needs_you" else "Your agent's run failed:\n%s") % body
+                post += again if open_ else ""
+        if send:
+            self._audit_ask(ask, "answered", len(text))
+            self._deliver(ask, "answered", text, by="agent")
+        return self._post_received(ask, post)
+
+    def _closed_ask_thread(self, user, thread):
+        """True when `thread` is the approval thread (user asked) or received thread (user was asked) of a closed ask."""
+        for a in self.state.asks():
+            if a.get("closed_at") is None:
+                continue
+            if (a["from"] == user and a.get("approval_thread") == thread) or \
+                    (a["to"] == user and a.get("received_thread") == thread):
+                return True
+        return False
+
+    def check_asks(self):
+        """Run with the outbox (nudger thread): questions nobody approved in time expire, a hand-over whose post failed
+        is tried again, an answer not picked up in time goes to the asker's DM, old asks are pruned. Returns how many
+        asks expired or settled."""
+        done = 0
+        for a in self.state.asks():
+            if a.get("closed_at") is not None:
+                continue
+            age = self.now() - float(a.get("created_at") or 0)
+            if a.get("status") == "awaiting_ok" and age >= self.cfg.ask_approval_seconds:
+                done += 1 if self._expire(a["ask"]) else 0
+            elif a.get("status") == "with_person" and not a.get("handed_at"):
+                with self.run_lock:
+                    if self._open_ask(a["ask"], "with_person") and not self.state.get(a["ask"]).get("handed_at"):
+                        self._hand_to_person(a["ask"])
+            elif a.get("delivered_at") is not None and \
+                    self.now() - float(a["delivered_at"]) >= self.cfg.ask_dm_fallback_seconds:
+                done += 1 if self._settle(a) else 0
+        self.state.prune()
+        return done
+
+    def _expire(self, ask_id):
+        with self.run_lock:
+            ask = self._open_ask(ask_id, "awaiting_ok")
+            if ask is None:
+                return False
+            self.state.update(ask_id, status="expired")
+            self._audit_ask(ask, "expired", len(ask["text"]))
+            hours = self.cfg.ask_approval_seconds / 3600.0
+            self._deliver(ask, "expired", "%s did not approve it in time." % shown(ask["from_name"]))
+        p = self._person_of(ask["from"])
+        if p and p.get("chat_space") and ask.get("approval_thread"):
+            try:
+                self._reply(p["chat_space"], "Not sent: no yes within %g hours." % hours, ask["approval_thread"])
+            except Exception as e:                         # noqa: BLE001
+                log.warning("could not tell %s ask %s expired: %s", ask["from"], ask_id, e.__class__.__name__)
+        return True
 
     def _sweep_stale_runs(self):
         """A run that never reported (killed for time or memory) must not hold the person or a box slot for ever."""
         with self.run_lock:
+            for a in self.state.asks():
+                if a.get("run_status") != "running" or self.now() - float(a.get("last_at") or 0) <= RUN_STALE_SECONDS:
+                    continue
+                ref = a.get("run_ref") or ""
+                a = self.state.update(a["ask"], run_status="idle", run_ref=None, last_at=self.now())
+                log.warning("ask run %s for %s never reported; marked failed", ref, a["to"])
+                if ref.startswith("a") and a.get("status") == "asking_agent" and a.get("closed_at") is None:
+                    self._hand_to_person(a["ask"])
+                elif ref.startswith("d"):
+                    self._post_received(a, "Your agent stopped without an answer (it ran out of time or memory). "
+                                           "Reply here to answer, or say do it again.")
             for t in self.state.tasks():
                 if t.get("run_status") != "running" or self.now() - float(t.get("last_at") or 0) <= RUN_STALE_SECONDS:
                     continue
@@ -1024,11 +1422,15 @@ class Bridge:
     def _start_queued(self):
         """Start waiting runs, longest-waiting first, while the box has a free slot."""
         with self.run_lock:
-            waiting = sorted((t for t in self.state.tasks() if t.get("run_status") == "queued"),
+            waiting = sorted([t for t in self.state.tasks() if t.get("run_status") == "queued"] +
+                             [a for a in self.state.asks() if a.get("run_status") == "queued"],
                              key=lambda t: float(t.get("last_at") or 0))
             for t in waiting:
                 if self.state.running() >= self.cfg.chat_runs_at_once:
                     return
+                if "ask" in t and "ref" not in t:          # an ask's answer or do-it run
+                    self._start_queued_ask(t)
+                    continue
                 ref, user = t["ref"], t["user"]
                 p = self._person_of(user)
                 if not p or p.get("status") != "active" or not p.get("chat_space") or not isinstance(t.get("request"), dict):
@@ -1039,6 +1441,21 @@ class Bridge:
                     self._launch(user, p["chat_space"], t.get("thread"), ref, t["request"])
                 except Exception:                          # noqa: BLE001 - one person's Chat error must not stop the rest
                     log.exception("could not start queued chat run %s for %s", ref, user)
+
+    def _start_queued_ask(self, a):
+        """Called under run_lock by _start_queued."""
+        ask_id, ref = a["ask"], a.get("run_ref") or ""
+        colleague = self._person_of(a["to"])
+        wanted = {"a": "asking_agent", "d": "with_person"}.get(ref[:1])
+        if a.get("closed_at") is not None or a.get("status") != wanted or not colleague or \
+                colleague.get("status") != "active" or not isinstance(a.get("request"), dict) or not REF_RE.match(ref):
+            self.state.update(ask_id, run_status="idle", run_ref=None, request=None)
+            log.warning("dropped queued ask run %s for %s", ref, a["to"])
+            return
+        try:
+            self._launch_ask(ask_id, ref, a["request"])
+        except Exception:                                  # noqa: BLE001
+            log.exception("could not start queued ask run %s for %s", ref, a["to"])
 
     # ---- the doorbell: messages agents and jobs leave for their own user; results of Chat runs come the same way
     def check_outbox(self):
@@ -1383,6 +1800,35 @@ class SystemHost:
             return []
         return take(pw.pw_dir, pw.pw_uid)
 
+    @staticmethod
+    def _inbox_target(user, ask_id):
+        import pwd
+        from agent_outbox import ASK_ID_RE
+        if not isinstance(ask_id, str) or not ASK_ID_RE.match(ask_id):
+            raise ValueError("bad ask id")
+        return pwd.getpwnam(user), ask_id + ".json"
+
+    def write_inbox(self, user, ask_id, body):
+        """The answer to an ask, as ~/.claude/inbox/<ask>.json in the asker's home (owner-checked, no symlinks, 600),
+        where their waiting ask-colleague reads and deletes it. Raises on anything unsafe."""
+        from agent_outbox import INBOX, write_user_file
+        pw, name = self._inbox_target(user, ask_id)
+        write_user_file(pw.pw_dir, pw.pw_uid, pw.pw_gid, INBOX, name, body)
+
+    def inbox_taken(self, user, ask_id):
+        """True once the asker's agent has read (and so deleted) the answer file."""
+        from agent_outbox import INBOX, user_file_exists
+        try:
+            pw, name = self._inbox_target(user, ask_id)
+        except (KeyError, ValueError):
+            return False
+        return not user_file_exists(pw.pw_dir, pw.pw_uid, INBOX, name)
+
+    def remove_inbox(self, user, ask_id):
+        from agent_outbox import INBOX, remove_user_file
+        pw, name = self._inbox_target(user, ask_id)
+        remove_user_file(pw.pw_dir, pw.pw_uid, INBOX, name)
+
     def agent_job(self, user, args):
         r = self._as(user, ["/usr/local/bin/agent-job"] + list(args))
         return r.returncode, (r.stdout + r.stderr)
@@ -1441,7 +1887,7 @@ def main():
 
     def nudger():
         while not stop.wait(cfg.nudge_check_seconds):
-            for check in (bridge.check_nudges, bridge.check_outbox):
+            for check in (bridge.check_nudges, bridge.check_outbox, bridge.check_asks):
                 try:
                     check()
                 except Exception:                              # noqa: BLE001
