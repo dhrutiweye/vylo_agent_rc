@@ -711,6 +711,15 @@ class TestBusyCheck(Base):
         self.assertEqual(self.restarts(), [("switch_session", "asha", "session_0AOLD")])
         self.assertIn("Back on your earlier session", self.chat.last())
 
+    def test_a_waiting_ask_colleague_does_not_count_as_busy(self):
+        # SystemHost.running_commands reads /proc, so the "does this process count" rule is a pure function.
+        snap = b"/home/asha/.claude/shell-snapshots/"
+        sh = b"bash\0-c\0source /home/asha/.claude/shell-snapshots/s.sh && eval '%s'"
+        self.assertTrue(cb.counts_as_command(sh % b"sleep 600", snap))
+        self.assertFalse(cb.counts_as_command(sh % b"/usr/local/bin/ask-colleague priya q &", snap))
+        self.assertFalse(cb.counts_as_command(sh % b"ask-colleague priya q", snap))
+        self.assertFalse(cb.counts_as_command(b"sleep\0600", snap))          # not a Claude shell at all
+
     def test_one_persons_question_is_not_answered_by_another(self):
         self.activate("ravi"); self.host.running = 1
         self.b.handle_event(classic("new session"))

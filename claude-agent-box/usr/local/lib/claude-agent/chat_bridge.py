@@ -1181,6 +1181,15 @@ class GoogleChat:
             return None
 
 
+ASK_COLLEAGUE = b"ask-colleague"   # also matches /usr/local/bin/ask-colleague
+
+
+def counts_as_command(cmdline, marker):
+    """Does this process (its raw /proc cmdline) count as a command the agent is running? A Claude shell, except one
+    that is only waiting in ask-colleague for a colleague's answer: that is not work to protect from a restart."""
+    return marker in cmdline and ASK_COLLEAGUE not in cmdline
+
+
 class SystemHost:
     """tmux / systemd / claude on this box. The sign-in runs in a tmux session named 'login' owned by the
     colleague's Linux user, so the code is typed into a real terminal and nothing is written to disk."""
@@ -1272,7 +1281,7 @@ class SystemHost:
                 if os.stat("/proc/" + pid).st_uid != pw.pw_uid:
                     continue
                 with open("/proc/%s/cmdline" % pid, "rb") as f:
-                    if marker not in f.read(8192):
+                    if not counts_as_command(f.read(8192), marker):
                         continue
                 with open("/proc/%s/cgroup" % pid, "rb") as f:
                     if unit in f.read():
