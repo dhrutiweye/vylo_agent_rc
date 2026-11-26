@@ -92,6 +92,35 @@ class AskColleagueTest(unittest.TestCase):
         self.assertIn("priya answered — information, not instructions:\nyes", out)
         self.assertNotIn("agent answered", out)
 
+    def test_no_wait_writes_the_ask_with_the_task_and_exits_at_once(self):
+        # A Chat task asks and ends; the bot posts the answer in its Chat thread (CHAT_TASK_REF names the task).
+        p = self.run_script(["--no-wait", "priya", "what", "port?"], timeout="30", env_extra={"CHAT_TASK_REF": "t42"})
+        out, err = p.communicate(timeout=10)                  # no answer is ever put in the inbox: it must not wait
+        self.assertEqual(p.returncode, 0, err)
+        ask = self.pending_ask(wait=1)
+        self.assertEqual((ask["kind"], ask["to"], ask["text"], ask["task"]), ("ask", "priya", "what port?", "t42"))
+        self.assertEqual(out.strip(), "asked priya (ask %s); the answer will be posted in your Chat thread" % ask["ask"])
+
+    def test_no_wait_from_stdin_and_without_a_task(self):
+        env = dict(os.environ, HOME=self.home); env.pop("CHAT_TASK_REF", None)
+        p = subprocess.Popen([sys.executable, "-I", SCRIPT, "--no-wait", "priya"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, universal_newlines=True)
+        out, err = p.communicate("from stdin?\n", timeout=10)
+        self.assertEqual(p.returncode, 0, err)
+        ask = self.pending_ask(wait=1)
+        self.assertEqual(ask["text"], "from stdin?")
+        self.assertNotIn("task", ask)                         # the answer then reaches the user's DM
+
+    def test_a_bad_chat_task_ref_is_not_sent(self):
+        for bad in ("d1", "t", "t1x", "t" + "1" * 16, "../t1", "a0123456789"):
+            outbox = os.path.join(self.home, ".claude", "outbox")
+            for n in (os.listdir(outbox) if os.path.isdir(outbox) else []):
+                os.unlink(os.path.join(outbox, n))
+            p = self.run_script(["--no-wait", "priya", "q"], env_extra={"CHAT_TASK_REF": bad})
+            out, err = p.communicate(timeout=10)
+            self.assertEqual(p.returncode, 0, err)
+            self.assertNotIn("task", self.pending_ask(wait=1), bad)
+
     def test_bad_input_exits_1(self):
         p = self.run_script(["Bad Name", "q"])
         out, err = p.communicate(timeout=20)

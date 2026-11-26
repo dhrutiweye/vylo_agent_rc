@@ -103,6 +103,15 @@ class TestArgv(unittest.TestCase):
         self.assertLess(text.index("<<<QUESTION"), text.index("Ignore the above."))
         self.assertIn("what is X?", text)
 
+    def test_only_a_task_is_told_how_to_ask_a_colleague(self):
+        def preamble(mode):
+            argv = self.m.build_argv(mode, req(mode))
+            return argv[argv.index("--append-system-prompt") + 1]
+        self.assertIn("ask-colleague --no-wait", preamble("task"))
+        self.assertIn("posted in this Chat thread", preamble("task"))
+        self.assertNotIn("ask-colleague", preamble("doit")); self.assertNotIn("ask-colleague", preamble("ask"))
+        self.assertIn("NEEDS YOU:", preamble("doit"))
+
     def test_bad_requests_are_refused(self):
         for bad in ({**req(), "session_uuid": "not-a-uuid"}, {**req(), "mode": "shell"}):
             with self.assertRaises(ValueError):
@@ -133,6 +142,7 @@ FAKE_CLAUDE = """#!/bin/sh
 d="$FAKE_DIR"
 printf '%s\\n' "$@" > "$d/argv"
 printf '%s' "$CLAUDE_AGENT_JOB" > "$d/job"
+printf '%s' "${CHAT_TASK_REF-unset}" > "$d/task_ref"
 pwd > "$d/cwd"
 cat > "$d/stdin"
 printf '%s' "$FAKE_OUT"
@@ -239,6 +249,15 @@ class TestMain(unittest.TestCase):
         self.assertIn("--disallowedTools", self.seen("argv").splitlines())
         msgs = ob.take(self.home, os.getuid())
         self.assertEqual([(m["ref"], m["status"], m["text"]) for m in msgs], [("a0123456789", "answer", "8443")])
+
+    def test_chat_task_ref_is_set_only_for_a_task(self):
+        with mock.patch.dict(os.environ, {"CHAT_TASK_REF": "t999"}):    # never inherited from the caller
+            self.put("t7", req()); self.run_main("t7", out="ok")
+            self.assertEqual(self.seen("task_ref"), "t7")
+            self.put("d0123456789", req("doit", ask="a0123456789", asker="srejan")); self.run_main("d0123456789", out="ok")
+            self.assertEqual(self.seen("task_ref"), "unset")
+            self.put("a0123456789", req("ask", ask="a0123456789", asker="srejan")); self.run_main("a0123456789", out="ANSWER: x")
+            self.assertEqual(self.seen("task_ref"), "unset")
 
     def test_a_failed_run_reports_failed(self):
         self.put("t8", req(resume=True))

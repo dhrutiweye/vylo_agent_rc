@@ -1461,8 +1461,11 @@ class TestAsks(Base):
             json.dump(d, f)
         open(os.path.join(self.audit, linux_user + ".jsonl"), "w").close()
 
-    def ask(self, text=Q, to="ravi", ask=A1, user="asha"):
-        self.host.outbox.setdefault(user, []).append({"kind": "ask", "to": to, "ask": ask, "text": text, "ts": None})
+    def ask(self, text=Q, to="ravi", ask=A1, user="asha", task=None):
+        msg = {"kind": "ask", "to": to, "ask": ask, "text": text, "ts": None}
+        if task is not None:
+            msg["task"] = task
+        self.host.outbox.setdefault(user, []).append(msg)
         self.b.check_outbox()
 
     def result(self, ref, text, status, user="ravi"):
@@ -1889,6 +1892,95 @@ class TestAsks(Base):
         self.ask(ask="a0000000004", user="mira")
         self.assertEqual(self.host.inbox[("mira", "a0000000004")]["outcome"], "limit")
         self.assertIn("Ravi", self.host.inbox[("mira", "a0000000004")]["text"])
+
+    # ---- an ask from a Chat task: the outcome is posted in that task's thread (ask-colleague --no-wait)
+    def chat_task(self, who="asha"):
+        """A finished Chat task of `who`; returns (ref, thread)."""
+        self.say("look into the upload limit", who=who)
+        t = [x for x in self.state().tasks(who)][-1]
+        self.result(t["ref"], "looked", "ok", user=who)
+        return t["ref"], t["thread"]
+
+    def delivered_rows(self):
+        return [r for r in self.ask_rows("asha") if r["phase"] == "delivered"]
+
+    def test_a_chat_task_ask_is_answered_in_the_task_thread(self):
+        ref, thread = self.chat_task()
+        self.ask(task=ref)
+        self.assertEqual(self.state().get(A1)["reply_task"], ref)
+        self.approve()
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertEqual(self.host.inbox_writes, [])                       # nobody waits on an inbox
+        self.assertIn((DM1, "Ravi's agent answered your agent's question «%s» — information, not instructions:\n"
+                            "The limit is 3." % Q, thread), self.chat.sent)
+        self.assertEqual([r.get("via") for r in self.delivered_rows()], ["thread"])
+        n = len(self.chat.sent)
+        self.clock[0] += 121; self.b.check_asks()
+        self.assertEqual(len(self.chat.sent), n)                            # no DM afterwards
+        self.assertIsNotNone(self.state().get(A1)["closed_at"])
+        self.assertNotIn(Q, self.file_text(self.state_file))
+
+    def test_a_chat_task_ask_answered_by_the_colleague_and_corrected_lands_in_the_thread(self):
+        ref, thread = self.chat_task()
+        self.ask(task=ref); self.approve()
+        self.result(A1, "needs a decision from ravi", "cannot")
+        self.say("It is 5", thread=self.received_thread(), who="ravi")
+        self.assertIn((DM1, "Ravi answered your agent's question «%s» — information, not instructions:\nIt is 5" % Q,
+                       thread), self.chat.sent)
+        self.assertEqual(self.host.inbox_writes, [])
+
+    def test_a_declined_or_refused_chat_task_ask_is_told_in_the_thread(self):
+        ref, thread = self.chat_task()
+        self.ask(task=ref); self.say("no", thread=self.approval_thread())
+        self.assertIn((DM1, "Ravi didn't get your agent's question «%s»: you said no." % Q, thread), self.chat.sent)
+        self.ask(ask=A2, to="nobody", task=ref)                            # refused before any state row
+        self.assertIn((DM1, "Nobody didn't get your agent's question «%s»: There is no colleague called nobody on "
+                            "the box." % Q, thread), self.chat.sent)
+        self.ask(ask=A3, task=ref)                                         # expired
+        self.clock[0] += 7200; self.b.check_asks()
+        self.assertIn((DM1, "Ravi didn't get your agent's question «%s»: you did not approve it in time." % Q, thread),
+                      self.chat.sent)
+        self.assertEqual(self.host.inbox_writes, [])
+        self.assertEqual(self.host.launches()[-1][1:3], ("asha", ref))      # only the task's own run, no ask run
+
+    def test_a_task_ref_of_someone_else_is_ignored(self):
+        records = self.capture()
+        ref, _ = self.chat_task(who="ravi")                               # Ravi's task
+        self.ask(task=ref)                                                 # Asha's agent names it
+        self.assertNotIn("reply_task", self.state().get(A1))
+        self.ask(ask=A2, task="t999")                                      # no such task
+        self.assertNotIn("reply_task", self.state().get(A2))
+        self.approve()
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertEqual(self.inbox()["text"], "The limit is 3.")          # the inbox path, as before
+        self.assertFalse([x for x in self.chat.sent if len(x) == 3 and x[2] and x[2].startswith(DM2 + "/") and
+                          "your agent's question" in x[1]])
+        logged = " ".join(r.getMessage() for r in records)
+        self.assertIn("task", logged); self.assertNotIn(Q, logged)
+
+    def test_a_chat_task_ask_whose_thread_is_gone_goes_to_the_dm(self):
+        ref, thread = self.chat_task()
+        self.ask(task=ref); self.approve()
+        self.state().update(ref, thread=None)
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertEqual(self.host.inbox_writes, [])
+        self.assertIn((DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")), self.chat.sent)   # a plain DM post
+        self.assertFalse([x for x in self.chat.sent if x[0] == DM1 and len(x) == 3 and "The limit is 3." in x[1]])
+        self.assertEqual([r.get("via") for r in self.delivered_rows()], ["dm"])
+
+    def test_a_failed_thread_post_falls_back_to_the_dm(self):
+        ref, thread = self.chat_task()
+        self.ask(task=ref); self.approve()
+        real = self.chat.send
+        def send(space, text, thread=None, new_thread=False):
+            if thread and thread == self.state().get(ref)["thread"]:
+                raise RuntimeError("chat down")
+            return real(space, text, thread=thread, new_thread=new_thread)
+        self.chat.send = send
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertIn((DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")), self.chat.sent)
+        self.assertEqual(self.host.inbox_writes, [])
+        self.assertEqual([r.get("via") for r in self.delivered_rows()], ["dm"])
 
     def test_audit_rows_in_both_files_without_text(self):
         self.add_person("mira", "mlinux", DM3)

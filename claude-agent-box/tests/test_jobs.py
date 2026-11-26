@@ -92,6 +92,29 @@ class TestOutbox(unittest.TestCase):
         self.assertEqual((got[1]["ref"], got[1]["status"], got[1]["text"]), ("t12", "ok", "done"))
         self.assertEqual(got[2]["ref"], "d" + aid[1:])
 
+    def test_an_ask_from_a_chat_task_names_the_task(self):
+        aid = ob.write_ask(self.home, "ravi", "which port?", task="t7")
+        ob.write_ask(self.home, "ravi", "no task")
+        got = ob.take(self.home, UID)
+        self.assertEqual([(g["ask"] == aid, g.get("task")) for g in got], [(True, "t7"), (False, None)])
+        self.assertNotIn("task", got[1])
+        for bad in ("d7", "t", "t7x", "t" + "1" * 16, 7, "../t7"):
+            self.assertRaises(ValueError, ob.write_ask, self.home, "ravi", "q", task=bad)
+
+    def test_take_drops_a_bad_task_on_an_ask(self):
+        d = os.path.join(self.home, ob.OUTBOX); os.makedirs(d)
+        bads = ["d7", "t7x", "t" + "1" * 16, 7, None, ["t1"]]
+        for i, bad in enumerate(bads + ["t15"]):
+            with open(os.path.join(d, "18000000000000000%02d-0000abcd.json" % i), "w") as f:
+                json.dump({"v": 1, "kind": "ask", "to": "ravi", "ask": "a%010x" % i, "text": "q", "task": bad}, f)
+        got = ob.take(self.home, UID)
+        self.assertEqual(len(got), len(bads) + 1)                       # the ask still goes; only the field drops
+        self.assertEqual([g.get("task") for g in got], [None] * len(bads) + ["t15"])
+        self.assertEqual(["task" in g for g in got], [False] * len(bads) + [True])
+        with open(os.path.join(d, "1800000000000000099-0000abcd.json"), "w") as f:   # results never carry one
+            json.dump({"v": 1, "kind": "result", "ref": "t1", "status": "ok", "text": "x", "task": "t1"}, f)
+        self.assertNotIn("task", ob.take(self.home, UID)[0])
+
     def test_plain_message_to_someone_else_is_still_dropped(self):
         d = os.path.join(self.home, ob.OUTBOX); os.makedirs(d)
         with open(os.path.join(d, "1800000000000000000-0000abcd.json"), "w") as f:

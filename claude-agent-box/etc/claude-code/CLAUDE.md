@@ -37,7 +37,9 @@ Always run it in the background (`run_in_background`) and carry on; it prints th
   The reason is printed; tell your user.
 - Exit 3: still no answer after 8 hours; it reaches your user's Chat DM when it comes.
 - Never put a secret, token or password in a question.
-- Scheduled jobs and Chat runs cannot ask.
+- Inside a Chat task (a task your user sent from Google Chat), use `ask-colleague --no-wait NAME` (question on stdin) and
+  do not wait: the answer is posted in that Chat thread.
+- Scheduled jobs, do-it runs and answer runs cannot ask.
 
 ## Reminders and scheduled work: `agent-job`
 

@@ -34,6 +34,7 @@ REQUESTS = ".claude/chat-requests"   # root drops run requests here for the coll
 TO_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 REF_RE = re.compile(r"^(t|a|d)[0-9a-z]{1,16}$")
 ASK_ID_RE = re.compile(r"^a[0-9a-f]{10}$")
+TASK_REF_RE = re.compile(r"^t[0-9]{1,15}$")       # a Chat task an ask came from (ask-colleague --no-wait)
 STATUSES = ("ok", "needs_you", "failed", "answer", "cannot")
 PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SOURCE_RE = re.compile(r"^(agent|box|job:[a-z0-9][a-z0-9_-]{0,31})$")   # box: claude-agent-monitor, to the admin
@@ -78,13 +79,19 @@ def write(home, text, source="agent", max_pending=50, max_chars=MAX_CHARS):
     return _drop(home, {"v": 1, "to": "self", "source": source, "text": text, "ts": int(time.time())}, max_pending)
 
 
-def write_ask(home, to, text, max_pending=50, max_chars=MAX_CHARS):
-    """Leave a question for colleague `to`. Returns the ask id ("a" + 10 hex). Raises ValueError."""
+def write_ask(home, to, text, max_pending=50, max_chars=MAX_CHARS, task=None):
+    """Leave a question for colleague `to`. Returns the ask id ("a" + 10 hex). Raises ValueError. task: the Chat task
+    (t<n>) it comes from, whose thread then gets the outcome; the bridge checks the task is the sender's own."""
     if not isinstance(to, str) or not TO_RE.match(to):
         raise ValueError("bad colleague name %r" % (to,))
+    if task is not None and not (isinstance(task, str) and TASK_REF_RE.match(task)):
+        raise ValueError("bad task ref %r" % (task,))
     text = _clean_text(text, max_chars)
     ask = "a" + uuid.uuid4().hex[:10]
-    _drop(home, {"v": 1, "kind": "ask", "to": to, "ask": ask, "text": text, "ts": int(time.time())}, max_pending)
+    msg = {"v": 1, "kind": "ask", "to": to, "ask": ask, "text": text, "ts": int(time.time())}
+    if task is not None:
+        msg["task"] = task
+    _drop(home, msg, max_pending)
     return ask
 
 
@@ -284,7 +291,7 @@ def remove_user_file(home, uid, rel_dir, name):
 
 
 def take(home, uid, limit=20):
-    """Read, validate and delete up to `limit` waiting messages, oldest first. Returns [{"kind": "self"|"ask"|"result", ...}]: self has source/text/ts, ask has to/ask/text/ts,
+    """Read, validate and delete up to `limit` waiting messages, oldest first. Returns [{"kind": "self"|"ask"|"result", ...}]: self has source/text/ts, ask has to/ask/text/ts (+ task when valid),
     result has ref/status/text/ts.
     A file that is unsafe or malformed is deleted and skipped; a message addressed to anyone but the sender is dropped."""
     try:
@@ -315,7 +322,11 @@ def take(home, uid, limit=20):
             if kind == "ask":
                 to, ask = m.get("to"), m.get("ask")
                 if (isinstance(to, str) and TO_RE.match(to)) and (isinstance(ask, str) and ASK_ID_RE.match(ask)):
-                    out.append({"kind": "ask", "to": to, "ask": ask, "text": text, "ts": ts})
+                    item = {"kind": "ask", "to": to, "ask": ask, "text": text, "ts": ts}
+                    task = m.get("task")
+                    if isinstance(task, str) and TASK_REF_RE.match(task):     # anything else: the field is dropped
+                        item["task"] = task
+                    out.append(item)
                 continue
             if kind == "result":
                 ref, status = m.get("ref"), m.get("status")

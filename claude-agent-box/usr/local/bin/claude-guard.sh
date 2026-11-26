@@ -417,7 +417,13 @@ scan() {  # $1 = command text; $2 = recursion depth
       "bash -c "*|"sh -c "*|"zsh -c "*|"bash -lc "*|"sh -lc "*)
         inner=${seg#* -*c }; inner=$(sed -E "s/^[\"']//; s/[\"']\$//" <<<"$inner"); scan "$inner" $((depth+1)) ;;
       ask-colleague|ask-colleague\ *|*/ask-colleague|*/ask-colleague\ *)
-        [ -n "${CLAUDE_AGENT_JOB:-}" ] && decide deny "A scheduled or Chat run cannot ask a colleague: there is nobody to wait for the answer. Report the question on a 'NEEDS YOU:' line instead." ;;
+        case "${CLAUDE_AGENT_JOB:-}" in
+          "") ;;                                         # an interactive session may ask
+          chat-t[0-9]*)                                  # a Chat task may ask without waiting: the answer comes in its thread
+            [[ "$seg " =~ ask-colleague[[:space:]]+--no-wait[[:space:]] ]] \
+              || decide deny "From a Chat task, ask with ask-colleague --no-wait NAME (question on stdin): the answer is posted in the Chat thread." ;;
+          *) decide deny "A scheduled job, a do-it run or an answer run cannot ask a colleague: there is nobody to wait for the answer. Report the question on a 'NEEDS YOU:' line instead." ;;
+        esac ;;
       git|git\ *) check_git "$seg" ;;
       gh|gh\ *) check_gh "$seg" ;;
       curl*|wget*|http\ *|https\ *) check_http "$seg" ;;

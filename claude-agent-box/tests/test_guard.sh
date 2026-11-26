@@ -222,11 +222,20 @@ unset CLAUDE_GUARD_MAX_SESSIONS CLAUDE_GUARD_VYLO_DIR
 
 echo "== chat and ask runs"
 export CLAUDE_GUARD_VYLO_DIR=$V CLAUDE_GUARD_MAX_SESSIONS=1
-for j in my-issues chat-t1 chat-d2 ask-a1; do
+for j in my-issues chat-d2 ask-a1 chat- chat-x1 chat-dt1; do            # scheduled jobs, do-it and answer runs never ask
   CLAUDE_AGENT_JOB=$j t deny Bash "ask-colleague anurag <<'Q'"
+  CLAUDE_AGENT_JOB=$j t deny Bash "ask-colleague --no-wait anurag <<'Q'"
+  CLAUDE_AGENT_JOB=$j t deny Bash "/usr/local/bin/ask-colleague --no-wait anurag"
 done
-CLAUDE_AGENT_JOB=chat-t1 t deny Bash "/usr/local/bin/ask-colleague anurag"
+# A Chat task (chat-t<n>) may ask, without waiting: the answer is posted in its Chat thread.
+CLAUDE_AGENT_JOB=chat-t1 t allow Bash "ask-colleague --no-wait anurag <<'Q'"
+CLAUDE_AGENT_JOB=chat-t12 t allow Bash "/usr/local/bin/ask-colleague --no-wait anurag"
+CLAUDE_AGENT_JOB=chat-t1 t allow Bash "cd /tmp && ask-colleague --no-wait anurag 'what port?'"
+CLAUDE_AGENT_JOB=chat-t1 t deny Bash "/usr/local/bin/ask-colleague anurag"      # a waiting ask would die with the run
+CLAUDE_AGENT_JOB=chat-t1 t deny Bash "ask-colleague anurag <<'Q'"
+CLAUDE_AGENT_JOB=chat-t1 t deny Bash "ask-colleague anurag --no-wait-x"
 t allow Bash "ask-colleague anurag"                                   # an interactive session may ask
+t allow Bash "ask-colleague --no-wait anurag"
 export CLAUDE_AGENT_JOB=chat-t1                                       # a Chat task is held to worktree rules even with one session
 t deny  Edit "{\"file_path\":\"$B/a.txt\"}"; t allow Edit "{\"file_path\":\"$W/a.txt\"}"
 t deny  Bash "git commit -m x" "$B"; t allow Bash "git commit -m x" "$W"
