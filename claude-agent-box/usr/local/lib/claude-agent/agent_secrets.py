@@ -7,8 +7,9 @@ message, a false negative leaks a credential into Chat and the audit trail.
     looks_secret(text) -> True when any known secret shape appears anywhere in the text
 
 Shapes: OpenAI-style sk-, GitHub ghp_ and github_pat_, AWS AKIA, Slack xox?-, three-part JWT, PEM private key header,
-and any long token (32+ characters of [A-Za-z0-9_-+/=]) holding an upper, a lower and a digit that is not pure hex
-(so git SHAs and UUIDs pass). The text itself is never logged here.
+and any long segment (32+ characters of [A-Za-z0-9_+], judged per segment: / = - . : and spaces split a token, so
+branch names, paths and SHA=... pass) holding an upper, a lower and a digit that is not pure hex (so git SHAs and
+UUIDs pass). The prefixed shapes must not start inside a word (disk-usage-... is not sk-). The text itself is never logged here.
 Standard library only, Python 3.9 compatible.
 """
 from __future__ import annotations
@@ -16,15 +17,15 @@ from __future__ import annotations
 import re
 
 _SHAPES = [
-    re.compile(r"sk-[A-Za-z0-9_-]{24,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{36}"),
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{24,}"),
+    re.compile(r"(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{36}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{40,}"),
-    re.compile(r"AKIA[A-Z0-9]{16}"),
-    re.compile(r"xox[a-z]-[A-Za-z0-9-]+"),
+    re.compile(r"(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}"),
+    re.compile(r"(?<![A-Za-z0-9])xox[a-z]-[A-Za-z0-9-]+"),
     re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 ]
-_LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-+/=]{32,}")
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9_+]{32,}")   # a segment: / = - . : and spaces all end one
 _HEX = re.compile(r"[0-9a-fA-F]+")
 
 

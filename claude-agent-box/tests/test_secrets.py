@@ -35,6 +35,10 @@ class TestLooksSecret(unittest.TestCase):
                   "123e4567-e89b-12d3-a456-426614174000",
                   "VOIC-410",
                   "abcdefghijklmnopqrstuvwxyzabcdef",
+                  "check the disk-usage-monitoring-dashboard-settings page",
+                  "VOIC-410-Fix-two-way-chat-bridge-v2",
+                  "src/main/java/com/Vylo/web/Service2/Handler",
+                  "SHA=0123456789abcdef0123456789abcdef01234567",
                   ""]:
             with self.subTest(text=s[:20]):
                 self.assertFalse(sec.looks_secret(s))
