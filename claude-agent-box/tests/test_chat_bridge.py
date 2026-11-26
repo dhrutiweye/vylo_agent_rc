@@ -1309,12 +1309,34 @@ class TestChatTasks(Base):
         self.b.handle_event(classic("and a third", thread=T1))
         self.assertEqual(len(self.host.launches()), 3)
 
-    def test_a_queued_reply_counts_too(self):
+    def test_a_queued_reply_counts_once_it_starts(self):
         self.b.cfg.chat_tasks_per_day = 2
         self.b.handle_event(classic("task one")); self.result("t1", "ok"); self.b.check_outbox()
         self.b.cfg.chat_runs_at_once = 0                                     # no free slot: the reply waits
         self.b.handle_event(classic("follow up", thread=T1))
         self.assertEqual(self.state().get("t1")["run_status"], "queued")
+        self.assertEqual(self.state().count_today("task", "asha"), 1)       # not yet: it has not run
+        self.b.cfg.chat_runs_at_once = 2
+        self.b.check_outbox()                                                # a slot: it starts
+        self.assertEqual(self.state().get("t1")["run_status"], "running")
+        self.assertEqual(self.state().count_today("task", "asha"), 2)
+        self.result("t1", "ok"); self.b.check_outbox()
+        self.assertEqual(self.state().count_today("task", "asha"), 2)       # counted once
+
+    def test_a_reply_that_cannot_start_is_not_counted(self):
+        self.b.cfg.chat_tasks_per_day = 2
+        self.b.handle_event(classic("task one")); self.result("t1", "ok"); self.b.check_outbox()
+        self.host.launch_ok = False
+        self.b.handle_event(classic("follow up", thread=T1))
+        self.assertEqual(self.chat.sent[-1][1], "I couldn't start your agent just now. Try again in a minute.")
+        self.assertEqual(self.state().count_today("task", "asha"), 1)
+        self.b.cfg.chat_runs_at_once = 0                                     # queued, then its start fails
+        self.b.handle_event(classic("follow up", thread=T1))
+        self.b.cfg.chat_runs_at_once = 2; self.b.check_outbox()
+        self.assertEqual(self.state().count_today("task", "asha"), 1)
+        self.host.launch_ok = True
+        self.b.handle_event(classic("follow up", thread=T1))
+        self.assertEqual(self.state().get("t1")["run_status"], "running")
         self.assertEqual(self.state().count_today("task", "asha"), 2)
 
     def test_a_broken_state_file_never_stops_the_commands(self):

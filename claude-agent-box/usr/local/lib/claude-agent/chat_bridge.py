@@ -950,8 +950,9 @@ class Bridge:
         return {"mode": "task", "prompt": prompt, "session_uuid": session_uuid, "resume": resume, "ask": None,
                 "asker": None}
 
-    def _launch(self, user, space, thread, ref, request):
-        """Start the run (never waits for it). On failure the task goes idle and the person is told in its thread."""
+    def _launch(self, user, space, thread, ref, request, count=False):
+        """Start the run (never waits for it). On failure the task goes idle and the person is told in its thread.
+        count: a reply in the task's thread, counted against the daily limit only once it has started."""
         ok = False
         try:
             ok = bool(self.host.launch_run(user, ref, request))
@@ -960,11 +961,14 @@ class Bridge:
         chars = len(request.get("prompt") or "")
         if ok:
             self.state.update(ref, status="running", run_status="running", request=None, last_at=self.now(),
-                              launched=True)       # its session id now exists: later replies --resume it
+                              launched=True, count_on_launch=False)   # its session id now exists: replies --resume it
+            if count:
+                self.state.log_task_run(user)
             self._audit(user, "chat_task", task=ref, chars=chars, phase="started")
             log.info("chat run %s started for %s", ref, user)
         else:
-            self.state.update(ref, status="failed", run_status="idle", request=None, last_at=self.now())
+            self.state.update(ref, status="failed", run_status="idle", request=None, last_at=self.now(),
+                              count_on_launch=False)
             self._audit(user, "chat_task", task=ref, chars=chars, phase="failed")
             self._reply(space, "I couldn't start your agent just now. Try again in a minute.", thread)
         return ok
@@ -1018,12 +1022,12 @@ class Bridge:
                 self._reply(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day, thread)
                 return
             request = self._request(body, task["session_uuid"], resume=bool(task.get("launched")))
-            self.state.log_task_run(user)                  # accepted (started or queued): it counts for today
-            if self.state.running() < self.cfg.chat_runs_at_once:
-                if self._launch(user, space, thread, ref, request):
+            if self.state.running() < self.cfg.chat_runs_at_once:   # counted for today once it has started
+                if self._launch(user, space, thread, ref, request, count=True):
                     self._reply(space, "On it.", thread)
             else:
-                self.state.update(ref, status="queued", run_status="queued", request=request, last_at=self.now())
+                self.state.update(ref, status="queued", run_status="queued", request=request, last_at=self.now(),
+                                  count_on_launch=True)
                 self._reply(space, "Got it." + QUEUED_NOTE, thread)
 
     def _person_of(self, user):
@@ -1495,11 +1499,12 @@ class Bridge:
                 ref, user = t["ref"], t["user"]
                 p = self._person_of(user)
                 if not p or p.get("status") != "active" or not p.get("chat_space") or not isinstance(t.get("request"), dict):
-                    self.state.update(ref, status="failed", run_status="idle", request=None)
+                    self.state.update(ref, status="failed", run_status="idle", request=None, count_on_launch=False)
                     log.warning("dropped queued chat run %s for %s: person no longer active", ref, user)
                     continue
                 try:
-                    self._launch(user, p["chat_space"], t.get("thread"), ref, t["request"])
+                    self._launch(user, p["chat_space"], t.get("thread"), ref, t["request"],
+                                 count=bool(t.get("count_on_launch")))
                 except Exception:                          # noqa: BLE001 - one person's Chat error must not stop the rest
                     log.exception("could not start queued chat run %s for %s", ref, user)
 
