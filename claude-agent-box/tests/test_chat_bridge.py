@@ -49,6 +49,13 @@ class FakeHost:
         self.running = 0                 # commands the agent is running
         self.max = 1                     # sessions this person's agent may serve (agent-max-sessions)
         self.litellm_result = "saved"
+        self.launch_ok = True            # launch_run's answer
+
+    def launch_run(self, user, ref, request):
+        self.calls.append(("launch", user, ref, request)); return self.launch_ok
+
+    def launches(self):
+        return [c for c in self.calls if c[0] == "launch"]
 
     def max_sessions(self, user):
         return self.max
@@ -154,7 +161,9 @@ class Base(unittest.TestCase):
             with open(os.path.join(self.audit, u + ".jsonl"), "w"):
                 pass
         self.clock = [1_800_000_000.0]
-        self.cfg = cb.Config({"PEOPLE_FILE": self.people, "AUDIT_DIR": self.audit, "NUDGE_MINUTES": "5", "LOGIN_TTL_SECONDS": "600"})
+        self.state_file = os.path.join(d, "chat", "state.json")
+        self.cfg = cb.Config({"PEOPLE_FILE": self.people, "AUDIT_DIR": self.audit, "NUDGE_MINUTES": "5", "LOGIN_TTL_SECONDS": "600",
+                              "CHAT_STATE_FILE": self.state_file})
         self.store = cb.PeopleStore(self.people)
         self.chat, self.host = FakeChat(), FakeHost()
         self.b = cb.Bridge(self.cfg, self.store, self.chat, self.host, now=lambda: self.clock[0])
@@ -972,6 +981,337 @@ class TestConfirmRemoteControl(unittest.TestCase):
     def test_does_nothing_when_the_agent_is_already_connected(self):
         h, ok = self.run_confirm(["Single session\nContinue coding at https://claude.ai/code/session_01XYZ"])
         self.assertFalse(ok); self.assertEqual(h.sent, [])
+
+
+T1 = "spaces/DM1/threads/T1"         # the thread FakeChat hands out for the first new_thread post
+ON_IT = "On it (task #%s). Reply in this thread to add to it."
+STILL_LAST_MESSAGE = "Still working on the last message; send it again when I answer."
+GH_TOKEN = "ghp_" + "Ab3" * 12          # 36 characters after the prefix: a GitHub token shape
+
+
+class TestChatTasks(Base):
+    """Free text from an active person is a task for their agent, run headless in its own Chat thread."""
+    def setUp(self):
+        super().setUp(); self.activate()
+
+    def state(self):
+        return cb.ChatState(self.state_file, lambda: self.clock[0])
+
+    def audit_rows(self, user="asha"):
+        return [r for r in cb.read_tail(os.path.join(self.audit, user + ".jsonl"))]
+
+    def audit_text(self, user="asha"):
+        with open(os.path.join(self.audit, user + ".jsonl")) as f:
+            return f.read()
+
+    def state_text(self):
+        try:
+            with open(self.state_file) as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def capture(self):
+        records = []
+        h = logging.Handler(); h.emit = records.append
+        lg = logging.getLogger("chat_bridge"); lg.addHandler(h); lg.setLevel(logging.DEBUG)
+        self.addCleanup(lg.removeHandler, h)
+        return records
+
+    def result(self, ref, text, status="ok", user="asha"):
+        self.host.outbox.setdefault(user, []).append({"kind": "result", "ref": ref, "status": status, "text": text, "ts": None})
+
+    def test_free_text_starts_a_task_in_a_new_thread(self):
+        self.b.handle_event(classic("fix the login bug", thread="spaces/DM1/threads/U1"))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", ON_IT % 1, T1))
+        launches = self.host.launches()
+        self.assertEqual(len(launches), 1)
+        _, user, ref, req = launches[0]
+        self.assertEqual((user, ref), ("asha", "t1"))
+        self.assertEqual(set(req), {"mode", "prompt", "session_uuid", "resume", "ask", "asker"})
+        self.assertEqual((req["mode"], req["prompt"], req["resume"], req["ask"], req["asker"]),
+                         ("task", "fix the login bug", False, None, None))
+        self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
+        t = self.state().get("t1")
+        self.assertEqual((t["user"], t["thread"], t["session_uuid"], t["run_status"]), ("asha", T1, req["session_uuid"], "running"))
+        rows = [r for r in self.audit_rows() if r["event"] == "chat_task"]
+        self.assertEqual([(r["task"], r["chars"], r["phase"]) for r in rows], [("t1", 17, "started")])
+
+    def test_reply_in_the_thread_resumes_the_same_conversation(self):
+        self.b.handle_event(classic("fix the login bug"))
+        self.result("t1", "Fixed in PR 12."); self.b.check_outbox()
+        self.b.handle_event(classic("also add a test", thread=T1))
+        first, second = self.host.launches()
+        self.assertEqual(second[1:3], ("asha", "t1"))
+        self.assertEqual((second[3]["mode"], second[3]["prompt"], second[3]["resume"]), ("task", "also add a test", True))
+        self.assertEqual(second[3]["session_uuid"], first[3]["session_uuid"])
+        self.assertEqual(self.chat.sent[-1][2], T1)                          # acknowledged in the same thread
+        self.assertEqual(self.state().get("t1")["run_status"], "running")
+        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("On it (task")]), 1)   # not a new task
+
+    def test_reply_while_running_is_turned_away(self):
+        self.b.handle_event(classic("fix the login bug"))
+        self.b.handle_event(classic("and the signup bug", thread=T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", STILL_LAST_MESSAGE, T1))
+        self.assertEqual(len(self.host.launches()), 1)
+
+    def test_a_yes_in_a_task_thread_goes_to_the_task(self):
+        self.b.handle_event(classic("delete the stale branch?"))
+        self.result("t1", "Shall I? NEEDS YOU: say yes", status="needs_you"); self.b.check_outbox()
+        self.b.handle_event(classic("yes", thread=T1))
+        self.assertEqual(self.host.launches()[-1][3]["prompt"], "yes")
+        self.assertNotIn("Nothing is waiting", " ".join(s[1] for s in self.chat.sent))
+
+    def test_result_is_posted_in_its_thread_and_cut(self):
+        self.b.handle_event(classic("write release notes"))
+        long_text = "word " * 600                                             # 3000 characters
+        self.result("t1", long_text.strip())
+        self.b.check_outbox()
+        space, text, thread = self.chat.sent[-1]
+        self.assertEqual((space, thread), ("spaces/DM1", T1))
+        self.assertTrue(text.startswith("word word"))
+        self.assertIn("full result: ask your agent to show ~/.claude/chat-results/t1.txt", text)
+        self.assertLess(len(text), 1500 + 200)
+        self.assertEqual(self.state().get("t1")["run_status"], "idle")
+        self.assertEqual(self.state().get("t1")["status"], "ok")
+        rows = [r for r in self.audit_rows() if r["event"] == "chat_task"]
+        self.assertEqual([r["phase"] for r in rows], ["started", "done"])
+        self.b.handle_event(classic("and a summary", thread=T1))
+        self.result("t1", "short answer"); self.b.check_outbox()            # a short one goes as it is
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "short answer", T1))
+
+    def test_needs_you_and_failed_results_say_so(self):
+        self.b.handle_event(classic("deploy it"))
+        self.result("t1", "Built.\nNEEDS YOU: approve the deploy", status="needs_you"); self.b.check_outbox()
+        self.assertIn("needs you", self.chat.sent[-1][1].lower()); self.assertIn("approve the deploy", self.chat.sent[-1][1])
+        self.b.handle_event(classic("try again", thread=T1))
+        self.result("t1", "failed (stopped after 10 minutes)", status="failed"); self.b.check_outbox()
+        self.assertIn("failed", self.chat.sent[-1][1].lower())
+        self.assertEqual([r["phase"] for r in self.audit_rows() if r["event"] == "chat_task"],
+                         ["started", "needs_you", "started", "failed"])
+
+    def test_commands_key_and_code_still_win_over_task_text(self):
+        for t in ("status", "help", "link", "jobs", "hi", "yes", "sessions"):
+            self.b.handle_event(classic(t))
+        self.b.handle_event(classic(KEY))
+        self.assertIn(("set_litellm_key", "asha", KEY), self.host.calls)
+        self.assertEqual(self.host.launches(), [])
+        self.b.handle_event(classic("fix it")); self.result("t1", "done"); self.b.check_outbox()
+        self.b.handle_event(classic(KEY, thread=T1))                         # a key pasted in a task thread is still a key
+        self.assertEqual(len(self.host.launches()), 1)
+        self.assertEqual([c for c in self.host.calls if c[0] == "set_litellm_key"], [("set_litellm_key", "asha", KEY)] * 2)
+        self.store.update("ravi", status="login_started", login_started_at=self.clock[0], chat_space="spaces/DM2")
+        self.b.handle_event(classic(CODE, email="ravi@co.test", space="spaces/DM2", thread="spaces/DM2/threads/Z"))
+        self.assertIn(("send_code", "ravi", CODE), self.host.calls)
+        self.assertEqual(len(self.host.launches()), 1)
+
+    def test_blank_and_too_long_messages(self):
+        n = len(self.chat.sent)
+        for blank in ("", "   ", "\n\t "):
+            self.b.handle_event(classic(blank))
+        self.assertEqual(len(self.chat.sent), n)                             # ignored: no reply at all
+        self.b.handle_event(classic("a" * 4001))
+        self.assertEqual(self.chat.last(), "That's too long for one message (4000 characters max).")
+        self.assertEqual(self.host.launches(), [])
+        self.b.handle_event(classic("a" * 4000))
+        self.assertEqual(len(self.host.launches()), 1)
+        self.result("t1", "ok"); self.b.check_outbox()
+        n = len(self.chat.sent)
+        self.b.handle_event(classic("  ", thread=T1)); self.assertEqual(len(self.chat.sent), n)
+        self.b.handle_event(classic("b" * 4001, thread=T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That's too long for one message (4000 characters max).", T1))
+        self.assertEqual(len(self.host.launches()), 1)
+
+    def test_inactive_person_gets_sign_in_replies_not_a_task(self):
+        self.b.handle_event(classic("fix the login bug", email="ravi@co.test", space="spaces/DM2"))
+        self.assertIn("don't know that one", self.chat.last())
+        self.store.update("ravi", status="login_started", login_started_at=self.clock[0])
+        self.b.handle_event(classic("fix the login bug", email="ravi@co.test", space="spaces/DM2"))
+        self.assertIn("Paste the code", self.chat.last())
+        self.b.handle_event(classic("fix it")); self.store.update("asha", status="pending")
+        self.b.handle_event(classic("more please", thread=T1))               # her old task thread, now signed out
+        self.assertIn("don't know that one", self.chat.last())
+        self.assertEqual(len(self.host.launches()), 1)
+        self.assertEqual(self.host.launches()[0][1], "asha")
+
+    def test_result_after_a_bridge_restart_lands_in_its_thread(self):
+        self.b.handle_event(classic("fix the login bug"))
+        chat2 = FakeChat()
+        b2 = cb.Bridge(self.cfg, cb.PeopleStore(self.people), chat2, self.host, now=lambda: self.clock[0])
+        self.result("t1", "Fixed in PR 12.")
+        b2.check_outbox()
+        self.assertEqual(chat2.sent, [("spaces/DM1", "Fixed in PR 12.", T1)])
+        b2.handle_event(classic("thanks, also the docs", thread=T1))
+        self.assertEqual(self.host.launches()[-1][3]["resume"], True)
+
+    def test_secret_task_is_refused_and_not_logged(self):
+        secret = "use this token " + GH_TOKEN
+        with self.assertLogs("chat_bridge", level="DEBUG") as logs:
+            self.b.handle_event(classic(secret))
+        self.assertEqual(self.chat.last(), "That looks like a secret, so I did not send it.")
+        self.assertEqual(self.host.launches(), [])
+        rows = [r for r in self.audit_rows() if r["event"] == "secret_blocked"]
+        self.assertEqual([r["where"] for r in rows], ["task"])
+        for where in [t[1] for t in self.chat.sent] + [self.audit_text(), self.state_text()] + logs.output:
+            self.assertNotIn(GH_TOKEN, where)
+        self.b.handle_event(classic("fix it")); self.result("t1", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("here: " + GH_TOKEN, thread=T1))        # a follow-up is checked too
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That looks like a secret, so I did not send it.", T1))
+        self.assertEqual(len(self.host.launches()), 1)
+
+    def test_a_secret_in_a_result_is_not_posted(self):
+        self.b.handle_event(classic("show me the config"))
+        self.result("t1", "The token is " + GH_TOKEN); self.b.check_outbox()
+        text = self.chat.sent[-1][1]
+        self.assertNotIn(GH_TOKEN, text); self.assertIn("chat-results/t1.txt", text)
+        self.assertEqual(self.state().get("t1")["run_status"], "idle")
+        self.assertIn('"secret_blocked"', self.audit_text()); self.assertNotIn(GH_TOKEN, self.audit_text())
+
+    def test_daily_cap_and_box_wide_slots(self):
+        self.b.handle_event(classic("task one"))
+        self.b.handle_event(classic("task two"))
+        self.assertEqual(self.chat.last(), "Still working on your last task (#1).")
+        self.assertEqual(len(self.host.launches()), 1)
+        self.b.cfg.chat_tasks_per_day = 2
+        self.result("t1", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("task two")); self.result("t2", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("task three"))
+        self.assertEqual(self.chat.last(), "You've used today's 2 Chat tasks.")
+        self.assertEqual(len(self.host.launches()), 2)
+        # box-wide: two runs at once, a third person's task waits for a slot
+        self.b.cfg.chat_tasks_per_day = 30
+        with open(self.people) as f:
+            d = json.load(f)
+        d["people"].append({"name": "mira", "email": "mira@co.test", "linux_user": "mira", "status": "active",
+                            "chat_space": "spaces/DM3", "chat_user": None, "session_id": None})
+        with open(self.people, "w") as f:
+            json.dump(d, f)
+        open(os.path.join(self.audit, "mira.jsonl"), "w").close()
+        self.activate("ravi"); self.store.update("ravi", chat_space="spaces/DM2")
+        self.host.calls.clear()
+        self.b.handle_event(classic("asha's run"))
+        self.b.handle_event(classic("ravi's run", email="ravi@co.test", space="spaces/DM2"))
+        self.b.handle_event(classic("mira's run", email="mira@co.test", space="spaces/DM3"))
+        self.assertEqual([c[1] for c in self.host.launches()], ["asha", "ravi"])
+        mira = self.state().tasks("mira")[0]
+        self.assertEqual(mira["run_status"], "queued")
+        self.assertIn(("spaces/DM3", ON_IT % mira["ref"][1:] + " It starts when a slot is free.", "spaces/DM3/threads/T%d" % self.chat.threads), self.chat.sent)
+        self.b.handle_event(classic("mira again", email="mira@co.test", space="spaces/DM3", thread=mira["thread"]))
+        self.assertEqual(self.chat.sent[-1][1], STILL_LAST_MESSAGE)       # queued counts as working
+        self.b.check_outbox()
+        self.assertEqual(len(self.host.launches()), 2)                      # still no free slot
+        self.result(self.state().tasks("ravi")[0]["ref"], "done", user="ravi")
+        self.b.check_outbox()
+        self.assertEqual([c[1] for c in self.host.launches()], ["asha", "ravi", "mira"])
+        last = self.host.launches()[-1]
+        self.assertEqual((last[2], last[3]["prompt"], last[3]["resume"]), (mira["ref"], "mira's run", False))
+        self.assertEqual(self.state().get(mira["ref"])["run_status"], "running")
+        self.assertNotIn("mira's run", self.state_text())                   # held only while it waited
+        self.assertEqual([(r["task"], r["phase"]) for r in self.audit_rows("mira") if r["event"] == "chat_task"],
+                         [(mira["ref"], "started")])
+
+    def test_task_text_is_never_logged(self):
+        records = self.capture()
+        texts = ["refactor the payments module", "and rename it", "Done: PR 44 opened"]
+        self.b.handle_event(classic(texts[0]))
+        self.result("t1", texts[2]); self.b.check_outbox()
+        self.b.handle_event(classic(texts[1], thread=T1))
+        self.b.handle_event(classic(texts[1], thread=T1))                  # turned away while running
+        for t in texts:
+            for where in [r.getMessage() for r in records] + [self.audit_text(), self.state_text()]:
+                self.assertNotIn(t, where)
+
+    def test_a_result_for_someone_elses_task_is_dropped(self):
+        self.activate("ravi"); self.store.update("ravi", chat_space="spaces/DM2")
+        records = self.capture()
+        self.b.handle_event(classic("fix the login bug"))
+        n = len(self.chat.sent)
+        self.result("t1", "forged answer", user="ravi")
+        self.b.check_outbox()
+        self.assertEqual(len(self.chat.sent), n)
+        self.assertEqual(self.state().get("t1")["run_status"], "running")
+        self.assertFalse([r for r in records if "forged answer" in r.getMessage()])
+        self.assertTrue([r for r in records if "t1" in r.getMessage()])     # logged by ref, without its text
+        self.result("t1", "the real answer"); self.b.check_outbox()
+        self.result("t1", "a second answer to a run that already ended"); self.b.check_outbox()
+        self.assertEqual([s[1] for s in self.chat.sent[n:]], ["the real answer"])
+
+    def test_ask_and_do_it_results_are_left_for_their_own_flow(self):
+        self.result("a0123456789", "an answer"); self.result("d0123456789", "did it")
+        self.b.check_outbox()
+        self.assertEqual(self.chat.sent, [])
+
+    def test_a_run_that_cannot_start_or_never_reports_frees_its_slot(self):
+        self.host.launch_ok = False
+        self.b.handle_event(classic("fix the login bug"))
+        self.assertIn("couldn't start", self.chat.sent[-1][1]); self.assertEqual(self.chat.sent[-1][2], T1)
+        self.assertEqual(self.state().get("t1")["run_status"], "idle")
+        self.host.launch_ok = True
+        self.b.handle_event(classic("again", thread=T1))
+        self.assertEqual(self.state().get("t1")["run_status"], "running")
+        self.assertIs(self.host.launches()[-1][3]["resume"], False)          # never started: no session to resume
+        self.b.handle_event(classic("again", thread=T1))                     # turned away while it runs
+        self.result("t1", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("more", thread=T1))
+        self.assertIs(self.host.launches()[-1][3]["resume"], True)           # it ran once: now it resumes
+        self.result("t1", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("one more", thread=T1))
+        self.clock[0] += 13 * 60                                              # past RuntimeMaxSec and some: it died
+        self.b.check_outbox()
+        self.assertEqual(self.state().get("t1")["run_status"], "idle")
+        self.assertIn("stopped without an answer", self.chat.sent[-1][1]); self.assertEqual(self.chat.sent[-1][2], T1)
+        self.assertEqual([r["phase"] for r in self.audit_rows() if r["event"] == "chat_task"][-1], "failed")
+
+    def test_doorbell_messages_still_go_through_beside_results(self):
+        self.b.handle_event(classic("fix it"))
+        self.host.outbox["asha"] = [{"source": "agent", "text": "PR ready", "ts": None},
+                                    {"kind": "result", "ref": "t1", "status": "ok", "text": "fixed", "ts": None}]
+        self.b.check_outbox()
+        self.assertIn(("spaces/DM1", "[agent] PR ready"), self.chat.sent)
+        self.assertIn(("spaces/DM1", "fixed", T1), self.chat.sent)
+
+
+class TestSystemHostLaunchRun(unittest.TestCase):
+    def test_request_goes_in_a_file_and_the_text_never_on_the_command_line(self):
+        import types
+        from unittest import mock
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        pw = types.SimpleNamespace(pw_dir=tmp.name, pw_uid=os.getuid(), pw_gid=os.getgid())
+        req = {"mode": "task", "prompt": "secret plan for the payments refactor", "session_uuid": CONV_A,
+               "resume": False, "ask": None, "asker": None}
+        runs = []
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        with mock.patch("pwd.getpwnam", return_value=pw), \
+                mock.patch.object(cb.subprocess, "run", side_effect=lambda cmd, **kw: (runs.append(cmd), R())[1]):
+            self.assertTrue(cb.SystemHost().launch_run("asha", "t7", req))
+        with open(os.path.join(tmp.name, ".claude", "chat-requests", "t7.json")) as f:
+            self.assertEqual(json.load(f), req)
+        self.assertEqual(oct(os.stat(os.path.join(tmp.name, ".claude", "chat-requests", "t7.json")).st_mode & 0o777), "0o600")
+        cmd = runs[0]
+        self.assertEqual(cmd[:2], ["systemd-run", "--no-block"])
+        for flag, value in (("--unit", "claude-chat-asha.t7"), ("--uid", "asha"), ("--gid", "asha"),
+                            ("--slice", "claudeagents.slice")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], value)
+        for prop in ("MemoryMax=1536M", "CPUQuota=100%", "RuntimeMaxSec=660", "Nice=10"):
+            self.assertIn(prop, cmd)
+        self.assertIn("--collect", cmd)
+        self.assertEqual(cmd[-2:], ["/usr/local/bin/agent-chat-exec", "t7"])
+        self.assertNotIn("payments", " ".join(cmd))
+
+    def test_a_failed_start_removes_the_request_and_says_false(self):
+        import types
+        from unittest import mock
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        pw = types.SimpleNamespace(pw_dir=tmp.name, pw_uid=os.getuid(), pw_gid=os.getgid())
+
+        class R:
+            returncode, stdout, stderr = 1, "", "Unit already exists"
+        with mock.patch("pwd.getpwnam", return_value=pw), mock.patch.object(cb.subprocess, "run", return_value=R()):
+            self.assertFalse(cb.SystemHost().launch_run("asha", "t7", {"mode": "task", "prompt": "x"}))
+            self.assertFalse(cb.SystemHost().launch_run("asha", "../x", {"mode": "task", "prompt": "x"}))
+        self.assertFalse(os.path.exists(os.path.join(tmp.name, ".claude", "chat-requests", "t7.json")))
 
 
 class TestStore(Base):

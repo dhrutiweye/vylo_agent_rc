@@ -3,7 +3,8 @@
   /var/lib/claude-agent-chat/state.json   mode 600, written via temp file + rename under an flock on state.lock
 
 Nothing here is a secret: thread names, ids, statuses and counters. An ask's question text is kept only until it
-is closed (`close` drops it). Every change reads, edits and writes the whole file under the lock, so two
+is closed (`close` drops it); a queued task's run request (its text, already secret-checked) only until the bridge
+starts it (`request` is then set to None). Every change reads, edits and writes the whole file under the lock, so two
 ChatState objects (or two processes) on one file never lose each other's updates.
 """
 from __future__ import annotations
@@ -132,6 +133,10 @@ class ChatState:
     def get(self, ref_or_ask):
         item = self._find(self._read(), ref_or_ask)
         return dict(item) if item else None
+
+    def tasks(self, user=None):
+        """Copies of the kept tasks, oldest first; only `user`'s when given."""
+        return [dict(t) for t in self._read()["tasks"] if user is None or t["user"] == user]
 
     def item_by_thread(self, user, thread):
         if not thread:

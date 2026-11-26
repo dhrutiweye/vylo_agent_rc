@@ -62,6 +62,13 @@ class TestChatState(Base):
         self.st.update("aaaaaaaaaaa", run_status="queued")
         self.assertEqual(self.st.running(), 1)
 
+    def test_tasks_lists_copies_oldest_first_optionally_for_one_user(self):
+        self.st.new_task("asha", "T1", "u1"); self.st.new_task("ravi", "T2", "u2"); self.st.new_task("asha", "T3", "u3")
+        self.assertEqual([t["ref"] for t in self.st.tasks()], ["t1", "t2", "t3"])
+        self.assertEqual([t["ref"] for t in self.st.tasks("asha")], ["t1", "t3"])
+        self.st.tasks("asha")[0]["status"] = "changed"            # a copy: the file is untouched
+        self.assertEqual(self.st.get("t1")["status"], "running")
+
     def test_newest_20_tasks_kept_per_user(self):
         for i in range(25):
             self.st.new_task("asha", "T%d" % i, "u%d" % i)

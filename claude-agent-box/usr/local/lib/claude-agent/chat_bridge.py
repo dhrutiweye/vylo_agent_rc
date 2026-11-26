@@ -10,18 +10,25 @@ user longer than NUDGE_MINUTES.
 
 It is also each agent's doorbell: messages an agent or one of its scheduled jobs leaves with notify-me
 (~/.claude/outbox, see agent_outbox.py) are posted to that person's own DM, at most OUTBOX_PER_HOUR an hour.
+
 And it manages the one live session per person: `new session`, `sessions`, `switch N`; and jobs: `jobs`,
 `job pause|resume|remove|run NAME` (run as that person's agent-job).
+
+Tasks from Chat: any other text from an active person is a task for their agent. The bridge never runs Claude: it
+posts "On it (task #N)" in a new thread, writes the request to ~/.claude/chat-requests/<ref>.json and starts
+agent-chat-exec as that person in a capped systemd unit (Host.launch_run). The run's result comes back through the
+outbox (kind "result", its ref) and is posted in the task's thread; a reply in that thread resumes the same headless
+conversation. Task state lives on disk (chat_state.py), so a result still finds its thread after a bridge restart.
 
 Events arrive on a Cloud Pub/Sub pull subscription (no inbound port); replies go out through the Chat
 REST API with the service-account key. All outside effects sit behind three small interfaces so the
 logic is tested with fakes (tests/test_chat_bridge.py):
 
     EventSource  pull() -> [(ack_id, event_dict)] ; ack([ack_id])
-    Chat         send(space, text)
+    Chat         send(space, text, thread=None, new_thread=False) -> thread name
     Host         start_login / send_code / wait_login_ok / stop_login / start_agent /
                  wait_session_id / service_active / session_id / take_outbox /
-                 new_session / switch_session / agent_job
+                 new_session / switch_session / agent_job / launch_run
 
 Config: environment (systemd EnvironmentFile=/etc/claude-agent/bridge.env). No secrets in code.
 Pasted sign-in codes and message text are never logged.
@@ -42,7 +49,9 @@ import time
 import uuid
 from collections import deque
 
-from agent_outbox import label
+from agent_outbox import REF_RE, label
+from agent_secrets import looks_secret
+from chat_state import ChatState
 
 log = logging.getLogger("chat_bridge")
 
@@ -67,14 +76,25 @@ HELP = ('hi — sign in / set up your agent\nstatus — is it running, last acti
         'switch N or switch NAME — go back to one from that list\n'
         'switch LINK — move your agent onto a session link copied from the Claude app\nforget N or forget all — drop from that list\n'
         'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
-        '(Chat with the agent itself in the Claude app. Ask it to set up reminders and jobs.)')
+        'anything else — a task for your agent; it answers in a thread, reply there to add to it\n'
+        '(Or chat with the agent itself in the Claude app. Ask it to set up reminders and jobs.)')
 HELP_MULTI = ('hi — sign in / set up your agent\nstatus — is it running, last activity\n'
               'sessions — your recent conversations, and which are active\n'
               'restart — restart your agent (asks first if it is busy)\n'
               'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
+              'anything else — a task for your agent; it answers in a thread, reply there to add to it\n'
               '(Your agent runs several sessions: start, open and close them in the Claude app. Ask it to set up '
               'reminders and jobs.)')
 ACTIVE_SECONDS = 600          # "sessions": a conversation with an audit row this recent is shown as active
+TASK_MAX_CHARS = 4000         # one Chat message given to the agent as a task
+RUN_STALE_SECONDS = 12 * 60   # a run unit dies at RuntimeMaxSec=660; one silent this long ended without reporting
+RUN_BUSY = ("running", "queued")
+ON_IT = "On it (task #%s). Reply in this thread to add to it."
+QUEUED_NOTE = " It starts when a slot is free."
+TOO_LONG = "That's too long for one message (%d characters max)." % TASK_MAX_CHARS
+SECRET_REFUSED = "That looks like a secret, so I did not send it."
+STILL_LAST_MESSAGE = "Still working on the last message; send it again when I answer."
+RESULTS_HINT = "ask your agent to show ~/.claude/chat-results/%s.txt"
 
 
 # ------------------------------------------------------------------ config
@@ -103,6 +123,7 @@ class Config:
         self.ask_approval_seconds = int(env.get("ASK_APPROVAL_SECONDS", "7200"))
         self.ask_dm_fallback_seconds = int(env.get("ASK_DM_FALLBACK_SECONDS", "120"))
         self.chat_result_chars = int(env.get("CHAT_RESULT_CHARS", "1500"))
+        self.chat_state_file = env.get("CHAT_STATE_FILE", "/var/lib/claude-agent-chat/state.json")
 
 
 # ------------------------------------------------------------------ people store (shared with add-colleague.sh)
@@ -285,8 +306,10 @@ def waiting_since(rows):
 
 # ------------------------------------------------------------------ the bridge
 class Bridge:
-    def __init__(self, cfg, store, chat, host, now=time.time):
+    def __init__(self, cfg, store, chat, host, now=time.time, state=None):
         self.cfg, self.store, self.chat, self.host, self.now = cfg, store, chat, host, now
+        self.state = state if state is not None else ChatState(cfg.chat_state_file, now)
+        self.run_lock = threading.Lock()   # handle_event and check_outbox (nudger thread) both start runs
         self.sent = {}                   # user -> deque of delivery times (the hourly doorbell limit)
         self.dropped = {}                # user -> messages dropped over the limit, reported with the next one
         self.seen = deque(maxlen=500)    # Chat message names already handled: a redelivery is ignored
@@ -354,13 +377,23 @@ class Bridge:
         self.store.update(person["name"], chat_space=m["space"], chat_user=m["user"])
         person = self.store.get(person["name"])
         text, low = m["text"], m["text"].strip().lower()
+        user = person["linux_user"]
+        # Routing order (design §3): the key (and, below, the sign-in code: only a login_started person, who never
+        # reaches the thread lookup) first; then the thread the message is in; then the commands; then a new task.
+        if LITELLM_KEY_RE.match(text.strip()):              # before everything: a key is never an OAuth code or a task
+            self.pending.pop(user, None)
+            self.on_litellm_key(person, m["space"], text.strip())
+            return
+        if person["status"] == "active" and m["thread"]:
+            found = self.state.item_by_thread(user, m["thread"])
+            if found and self._on_thread(person, m["space"], found, text):
+                self.pending.pop(user, None)
+                return
         if low in YES_WORDS:
             self.on_yes(person, m["space"])
             return
-        self.pending.pop(person["linux_user"], None)       # anything else withdraws an unanswered "are you sure"
-        if LITELLM_KEY_RE.match(text.strip()):              # before the sign-in branches: a key is never an OAuth code
-            self.on_litellm_key(person, m["space"], text.strip())
-        elif low in HI_WORDS:
+        self.pending.pop(user, None)                        # anything else withdraws an unanswered "are you sure"
+        if low in HI_WORDS:
             self.on_hi(person, m["space"])
         elif low == "status":
             self.on_status(person, m["space"])
@@ -390,6 +423,8 @@ class Bridge:
             self.on_code(person, m["space"], text)
         elif person["status"] == "login_started":
             self.chat.send(m["space"], 'Paste the code from the sign-in page here, or say "hi" to get a fresh link.')
+        elif person["status"] == "active":
+            self.on_task(person, m["space"], text)
         else:
             self.chat.send(m["space"], 'I don\'t know that one. Say "help" for what I can do; chat with your agent in the Claude app.')
 
@@ -807,7 +842,205 @@ class Bridge:
         rc, out = self.host.agent_job(person["linux_user"], args)
         self.chat.send(space, (out or ("done" if rc == 0 else "that did not work")).strip()[:3000])
 
-    # ---- the doorbell: messages agents and jobs leave for their own user
+    # ---- tasks from Chat: each task is its own headless conversation of the person's agent, in its own thread
+    def _reply(self, space, text, thread=None):
+        if thread:
+            return self.chat.send(space, text, thread=thread)
+        return self.chat.send(space, text)
+
+    def _on_thread(self, person, space, found, text):
+        """True when the message belonged to a known thread and was handled there."""
+        role, item = found
+        if role == "task":
+            self.on_task_reply(person, space, item, text)
+            return True
+        return self._on_ask_thread(person, space, role, item, text)
+
+    def _on_ask_thread(self, person, space, role, item, text):
+        """Task 7: a yes/no in an ask's approval thread, or a colleague's answer / "do it" in a received ask's thread.
+        Not built yet: returning False lets the message fall through to the commands and new-task routing."""
+        return False
+
+    def _usable_text(self, user, space, text, thread=None):
+        """The task text, or None when it must not be run (blank: ignored; too long or a secret: refused)."""
+        body = (text or "").strip()
+        if not body:
+            return None
+        if len(body) > TASK_MAX_CHARS:
+            self._reply(space, TOO_LONG, thread)
+            return None
+        if looks_secret(body):
+            log.info("refused a message from %s: it looks like a secret (where=task)", user)
+            self._audit(user, "secret_blocked", where="task")
+            self._reply(space, SECRET_REFUSED, thread)
+            return None
+        return body
+
+    def _busy_task(self, user):
+        return next((t for t in self.state.tasks(user) if t.get("run_status") in RUN_BUSY), None)
+
+    @staticmethod
+    def _request(prompt, session_uuid, resume):
+        return {"mode": "task", "prompt": prompt, "session_uuid": session_uuid, "resume": resume, "ask": None,
+                "asker": None}
+
+    def _launch(self, user, space, thread, ref, request):
+        """Start the run (never waits for it). On failure the task goes idle and the person is told in its thread."""
+        ok = False
+        try:
+            ok = bool(self.host.launch_run(user, ref, request))
+        except Exception:                                  # noqa: BLE001 - a failed start is reported, never fatal
+            log.exception("could not start chat run %s for %s", ref, user)
+        chars = len(request.get("prompt") or "")
+        if ok:
+            self.state.update(ref, status="running", run_status="running", request=None, last_at=self.now(),
+                              launched=True)       # its session id now exists: later replies --resume it
+            self._audit(user, "chat_task", task=ref, chars=chars, phase="started")
+            log.info("chat run %s started for %s", ref, user)
+        else:
+            self.state.update(ref, status="failed", run_status="idle", request=None, last_at=self.now())
+            self._audit(user, "chat_task", task=ref, chars=chars, phase="failed")
+            self._reply(space, "I couldn't start your agent just now. Try again in a minute.", thread)
+        return ok
+
+    def on_task(self, person, space, text):
+        user = person["linux_user"]
+        body = self._usable_text(user, space, text)
+        if body is None:
+            return
+        if self.state.count_today("task", user) >= self.cfg.chat_tasks_per_day:
+            self.chat.send(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day)
+            return
+        with self.run_lock:
+            busy = self._busy_task(user)
+            if busy:
+                self.chat.send(space, "Still working on your last task (#%s)." % busy["ref"][1:])
+                return
+            slot = self.state.running() < self.cfg.chat_runs_at_once     # read first: new_task counts as running
+            session_uuid = str(uuid.uuid4())
+            ref = self.state.new_task(user, None, session_uuid)["ref"]
+            request = self._request(body, session_uuid, resume=False)
+            if not slot:                                   # held (root-only state) until check_outbox finds a slot
+                self.state.update(ref, status="queued", run_status="queued", request=request)
+            try:
+                thread = self.chat.send(space, ON_IT % ref[1:] + ("" if slot else QUEUED_NOTE), new_thread=True)
+            except Exception:
+                self.state.update(ref, status="failed", run_status="idle", request=None)
+                raise
+            self.state.update(ref, thread=thread)
+            if slot:
+                self._launch(user, space, thread, ref, request)
+            else:
+                log.info("chat task %s for %s waits for a free slot", ref, user)
+
+    def on_task_reply(self, person, space, task, text):
+        """A message in a task's thread: the next turn of that same conversation."""
+        user, ref, thread = person["linux_user"], task["ref"], task.get("thread")
+        body = self._usable_text(user, space, text, thread)
+        if body is None:
+            return
+        with self.run_lock:
+            task = self.state.get(ref) or task
+            if task.get("run_status") in RUN_BUSY:
+                self._reply(space, STILL_LAST_MESSAGE, thread)
+                return
+            other = self._busy_task(user)
+            if other:
+                self._reply(space, "Still working on your last task (#%s)." % other["ref"][1:], thread)
+                return
+            request = self._request(body, task["session_uuid"], resume=bool(task.get("launched")))
+            if self.state.running() < self.cfg.chat_runs_at_once:
+                if self._launch(user, space, thread, ref, request):
+                    self._reply(space, "On it.", thread)
+            else:
+                self.state.update(ref, status="queued", run_status="queued", request=request, last_at=self.now())
+                self._reply(space, "Got it." + QUEUED_NOTE, thread)
+
+    def _person_of(self, user):
+        return next((p for p in self.store.all() if p.get("linux_user") == user), None)
+
+    def _on_result(self, p, msg):
+        """A run's result from p's own outbox. Only a run of p's own task is acted on; anything else is dropped and
+        logged by ref, never with its text. Returns True when something was posted."""
+        user, ref = p["linux_user"], msg["ref"]
+        if not ref.startswith("t"):
+            return self._on_ask_result(p, msg)
+        task = self.state.get(ref)
+        if not task or task.get("user") != user:
+            log.warning("dropped a result for %s from %s: not one of their tasks", ref, user)
+            return False
+        if task.get("run_status") != "running":
+            log.warning("dropped a result for %s from %s: no run of it is going", ref, user)
+            return False
+        status, text = msg.get("status"), msg["text"]
+        if status not in ("ok", "needs_you", "failed"):
+            status = "failed"
+        self.state.update(ref, status=status, run_status="idle", last_at=self.now())   # before posting: a Chat error
+        n, limit = ref[1:], self.cfg.chat_result_chars                                 # must not hold the slot
+        if looks_secret(text):
+            log.info("did not post the result of %s for %s: it looks like a secret (where=result)", ref, user)
+            self._audit(user, "secret_blocked", where="result")
+            post = ("Task #%s finished, but its answer looks like it holds a secret, so I did not post it. To read it, %s."
+                    % (n, RESULTS_HINT % ref))
+        else:
+            body = text if len(text) <= limit else text[:limit].rstrip() + "\n… full result: " + RESULTS_HINT % ref
+            post = {"needs_you": "Task #%s needs you:\n%s", "failed": "Task #%s failed:\n%s"}.get(status, "%s%s")
+            post = post % (("", body) if status == "ok" else (n, body))
+        self._audit(user, "chat_task", task=ref, chars=len(text), phase="done" if status == "ok" else status)
+        try:
+            self._reply(p["chat_space"], post, task.get("thread"))
+        except Exception:                                  # noqa: BLE001
+            log.exception("could not post the result of %s for %s", ref, user)
+            return False
+        return True
+
+    def _on_ask_result(self, p, msg):
+        """Task 7: the result of an ask's answer run (a…) or a do-it run (d…). Not built yet: dropped by ref."""
+        log.info("dropped a result for %s from %s: ask results arrive with the ask flow", msg["ref"], p["linux_user"])
+        return False
+
+    def _on_outbox_ask(self, p, msg):
+        """Task 7: a question p's agent wants to ask a colleague. Not built yet: dropped by id."""
+        log.info("dropped ask %s from %s: asking colleagues is not switched on yet", msg.get("ask"), p["linux_user"])
+
+    def _sweep_stale_runs(self):
+        """A run that never reported (killed for time or memory) must not hold the person or a box slot for ever."""
+        with self.run_lock:
+            for t in self.state.tasks():
+                if t.get("run_status") != "running" or self.now() - float(t.get("last_at") or 0) <= RUN_STALE_SECONDS:
+                    continue
+                ref, user = t["ref"], t["user"]
+                self.state.update(ref, status="failed", run_status="idle", last_at=self.now())
+                self._audit(user, "chat_task", task=ref, chars=0, phase="failed")
+                log.warning("chat run %s for %s never reported; marked failed", ref, user)
+                p = self._person_of(user)
+                if p and p.get("chat_space"):
+                    try:
+                        self._reply(p["chat_space"], "Task #%s stopped without an answer (it ran out of time or memory). "
+                                                     "Reply here to try again." % ref[1:], t.get("thread"))
+                    except Exception:                      # noqa: BLE001
+                        log.exception("could not tell %s about %s", user, ref)
+
+    def _start_queued(self):
+        """Start waiting runs, longest-waiting first, while the box has a free slot."""
+        with self.run_lock:
+            waiting = sorted((t for t in self.state.tasks() if t.get("run_status") == "queued"),
+                             key=lambda t: float(t.get("last_at") or 0))
+            for t in waiting:
+                if self.state.running() >= self.cfg.chat_runs_at_once:
+                    return
+                ref, user = t["ref"], t["user"]
+                p = self._person_of(user)
+                if not p or p.get("status") != "active" or not p.get("chat_space") or not isinstance(t.get("request"), dict):
+                    self.state.update(ref, status="failed", run_status="idle", request=None)
+                    log.warning("dropped queued chat run %s for %s: person no longer active", ref, user)
+                    continue
+                try:
+                    self._launch(user, p["chat_space"], t.get("thread"), ref, t["request"])
+                except Exception:                          # noqa: BLE001 - one person's Chat error must not stop the rest
+                    log.exception("could not start queued chat run %s for %s", ref, user)
+
+    # ---- the doorbell: messages agents and jobs leave for their own user; results of Chat runs come the same way
     def check_outbox(self):
         delivered = 0
         for p in self.store.all():
@@ -819,6 +1052,13 @@ class Bridge:
                 continue
             window = self.sent.setdefault(user, deque())
             for msg in msgs:
+                kind = msg.get("kind", "self")
+                if kind == "result":                       # before the hourly limit: a result is never dropped
+                    delivered += 1 if self._on_result(p, msg) else 0
+                    continue
+                if kind == "ask":
+                    self._on_outbox_ask(p, msg)
+                    continue
                 while window and self.now() - window[0] > 3600:
                     window.popleft()
                 if len(window) >= self.cfg.outbox_per_hour:
@@ -834,6 +1074,8 @@ class Bridge:
                 window.append(self.now())
                 self._audit(user, "notify", source=msg["source"].split(":")[0], chars=len(msg["text"]))
                 delivered += 1
+        self._sweep_stale_runs()
+        self._start_queued()
         return delivered
 
     # ---- nudges
@@ -1135,6 +1377,45 @@ class SystemHost:
     def agent_job(self, user, args):
         r = self._as(user, ["/usr/local/bin/agent-job"] + list(args))
         return r.returncode, (r.stdout + r.stderr)
+
+    def launch_run(self, user, ref, request):
+        """Write the request to ~/.claude/chat-requests/<ref>.json (owner-checked, no symlinks) and start
+        agent-chat-exec as the person in a capped unit, without waiting. The text is never on a command line.
+        True when systemd took the unit."""
+        import pwd
+        from agent_outbox import REQUESTS, remove_user_file, write_user_file
+        if not isinstance(ref, str) or not REF_RE.match(ref):
+            return False
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            return False
+        home, name = pw.pw_dir, ref + ".json"
+        try:
+            write_user_file(home, pw.pw_uid, pw.pw_gid, REQUESTS, name, request)
+        except OSError as e:
+            log.warning("could not write the run request %s for %s: %s", ref, user, e.__class__.__name__)
+            return False
+        cmd = ["systemd-run", "--no-block", "--collect", "--quiet", "--unit", "claude-chat-%s.%s" % (user, ref),
+               "--uid", user, "--gid", user, "--slice", "claudeagents.slice", "--working-directory", home,
+               "-p", "MemoryMax=1536M", "-p", "CPUQuota=100%", "-p", "RuntimeMaxSec=660", "-p", "Nice=10",
+               "--setenv", "HOME=" + home, "--setenv", "USER=" + user, "--setenv", "TERM=dumb",
+               "--setenv", "PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin" % home,
+               "/usr/local/bin/agent-chat-exec", ref]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd="/")
+            ok = r.returncode == 0
+            if not ok:
+                log.warning("systemd-run refused chat run %s for %s: %s", ref, user, (r.stderr or "").strip()[:200])
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("could not start chat run %s for %s: %s", ref, user, e.__class__.__name__)
+            ok = False
+        if not ok:
+            try:
+                remove_user_file(home, pw.pw_uid, REQUESTS, name)
+            except OSError:
+                pass
+        return ok
 
 
 def main():
