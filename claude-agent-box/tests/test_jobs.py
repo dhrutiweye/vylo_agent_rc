@@ -80,6 +80,75 @@ class TestOutbox(unittest.TestCase):
         ob.write(self.home, "hi")
         self.assertEqual(ob.take(self.home, UID + 1), [])
 
+    def test_ask_and_result_kinds_are_taken(self):
+        aid = ob.write_ask(self.home, "ravi", "can you check the deploy?")
+        self.assertRegex(aid, r"^a[0-9a-f]{10}$")
+        ob.write_result(self.home, "t12", "ok", "done")
+        ob.write_result(self.home, "d" + aid[1:], "needs_you", "stuck")
+        ob.write(self.home, "plain")
+        got = ob.take(self.home, UID)
+        self.assertEqual([g["kind"] for g in got], ["ask", "result", "result", "self"])
+        self.assertEqual((got[0]["to"], got[0]["ask"], got[0]["text"]), ("ravi", aid, "can you check the deploy?"))
+        self.assertEqual((got[1]["ref"], got[1]["status"], got[1]["text"]), ("t12", "ok", "done"))
+        self.assertEqual(got[2]["ref"], "d" + aid[1:])
+
+    def test_plain_message_to_someone_else_is_still_dropped(self):
+        d = os.path.join(self.home, ob.OUTBOX); os.makedirs(d)
+        with open(os.path.join(d, "1800000000000000000-0000abcd.json"), "w") as f:
+            json.dump({"v": 1, "to": "ravi", "text": "hello ravi"}, f)
+        self.assertEqual(ob.take(self.home, UID), [])
+
+    def test_bad_ask_name_and_bad_ref_are_refused(self):
+        for bad in ("Ravi", "1ravi", "", "a" * 33, "ra vi", "ra/vi"):
+            self.assertRaises(ValueError, ob.write_ask, self.home, bad, "hi")
+        self.assertRaises(ValueError, ob.write_ask, self.home, "ravi", "  ")
+        for ref in ("x1", "t", "T1", "t" + "1" * 17, "t1/../x", ""):
+            self.assertRaises(ValueError, ob.write_result, self.home, ref, "ok", "hi")
+        self.assertRaises(ValueError, ob.write_result, self.home, "t1", "weird", "hi")
+        self.assertRaises(ValueError, ob.write_result, self.home, "t1", "ok", " ")
+        self.assertEqual(ob.take(self.home, UID), [])
+
+    def test_root_writes_inbox_owned_by_the_user_and_user_reads_it_once(self):
+        aid = "a0123456789"
+        ob.write_user_file(self.home, UID, os.getgid(), ob.INBOX, aid + ".json", {"v": 1, "answer": "yes"})
+        p = os.path.join(self.home, ob.INBOX, aid + ".json")
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.join(self.home, ob.INBOX)).st_mode & 0o777, 0o700)
+        self.assertTrue(ob.user_file_exists(self.home, UID, ob.INBOX, aid + ".json"))
+        self.assertFalse(ob.user_file_exists(self.home, UID + 1, ob.INBOX, aid + ".json"))
+        self.assertEqual(ob.read_inbox(self.home, aid), {"v": 1, "answer": "yes"})
+        self.assertIsNone(ob.read_inbox(self.home, aid))
+        self.assertFalse(os.path.exists(p))
+        self.assertIsNone(ob.read_inbox(self.home, "../etc"))
+        ob.write_user_file(self.home, UID, os.getgid(), ob.REQUESTS, "r.json", {"x": 1})
+        ob.remove_user_file(self.home, UID, ob.REQUESTS, "r.json")
+        self.assertFalse(ob.user_file_exists(self.home, UID, ob.REQUESTS, "r.json"))
+        ob.remove_user_file(self.home, UID, ob.REQUESTS, "r.json")   # already gone: fine
+
+    def test_symlinked_inbox_dir_is_refused(self):
+        elsewhere = os.path.join(self.tmp.name, "elsewhere"); os.makedirs(elsewhere)
+        os.makedirs(os.path.join(self.home, ".claude"))
+        os.symlink(elsewhere, os.path.join(self.home, ob.INBOX))
+        self.assertRaises(OSError, ob.write_user_file, self.home, UID, os.getgid(), ob.INBOX, "a1.json", {"v": 1})
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertFalse(ob.user_file_exists(self.home, UID, ob.INBOX, "a1.json"))
+        self.assertRaises(OSError, ob.write_user_file, self.home, UID, os.getgid(), ob.INBOX, "../x.json", {})
+        self.assertRaises(OSError, ob.write_user_file, self.home, UID, os.getgid(), "../up", "x.json", {})
+        self.assertRaises(OSError, ob.write_user_file, self.home, UID + 1, os.getgid(), ob.REQUESTS, "x.json", {})
+
+    def test_existing_symlinked_target_file_is_replaced_not_followed(self):
+        victim = os.path.join(self.tmp.name, "victim.txt")
+        with open(victim, "w") as f:
+            f.write("keep")
+        d = os.path.join(self.home, ob.INBOX); os.makedirs(d)
+        os.symlink(victim, os.path.join(d, "a1.json"))
+        self.assertFalse(ob.user_file_exists(self.home, UID, ob.INBOX, "a1.json"))
+        ob.write_user_file(self.home, UID, os.getgid(), ob.INBOX, "a1.json", {"v": 1})
+        with open(victim) as vf:
+            self.assertEqual(vf.read(), "keep")
+        self.assertFalse(os.path.islink(os.path.join(d, "a1.json")))
+        self.assertTrue(ob.user_file_exists(self.home, UID, ob.INBOX, "a1.json"))
+
     def test_labels(self):
         self.assertEqual(ob.label("agent"), "[agent]"); self.assertEqual(ob.label("job:standup"), "[job standup]")
 
