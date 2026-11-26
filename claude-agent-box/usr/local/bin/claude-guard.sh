@@ -44,14 +44,48 @@ decide() {  # $1 = ask|deny   $2 = reason
 }
 protected() { [[ "$1" =~ $PROTECTED ]]; }
 
+VYLO=${CLAUDE_GUARD_VYLO_DIR:-$HOME/Documents/code/vylo}
+
 # ---------------------------------------------------------------- answer runs (CLAUDE_AGENT_JOB=ask-*)
-# A run answering a colleague's question may only read: Read/Grep/Glob, and the read tools of the Jira and GitHub
-# MCP servers (exact server names; the verb is judged as in mcp_check). Everything else is refused. The person's own
-# MCP allow-list still applies on top (mcp_check runs after this).
+# A run answering a colleague's question may only read: Read/Grep/Glob inside the vylo folder, and the read tools of
+# the Jira and GitHub MCP servers (exact server names; the verb is judged as in mcp_check). Everything else is refused.
+# The person's own MCP allow-list still applies on top (mcp_check runs after this). agent-chat-exec starts an answer
+# run with a PreToolUse hook matching every tool, so Read/Grep/Glob/WebFetch/Skill/... all reach this rule.
+answer_path_ok() {  # $1 = path as given (empty = the run's cwd): true when an answer run may read it
+  local p=$1 base=${cwd:-} v r h c
+  [ -n "$base" ] || return 1
+  [ -n "$p" ] || p=$base
+  case "$p" in "~") p=$HOME ;; "~/"*) p=$HOME/${p#"~/"} ;; "~"*) return 1 ;; esac   # ~other: someone else's home
+  [[ $p == /* ]] || p=$base/$p
+  v=$(realpath -m "$VYLO" 2>/dev/null) || return 1
+  r=$(realpath -m "$p" 2>/dev/null) || return 1          # resolves symlinks too: one pointing out of vylo is outside
+  [[ $r == "$v" || $r == "$v"/* ]] || return 1
+  h=$(realpath -m "$HOME" 2>/dev/null) || return 1
+  case "$r/" in "$h"/.claude*|"$h"/.config/*|"$h"/.ssh/*) return 1 ;; esac
+  local -a parts
+  IFS=/ read -r -d '' -a parts < <(printf '%s/%s' "$p" "$r")   # every name, as typed and as resolved (no globbing)
+  for c in "${parts[@]}"; do
+    case "$c" in *.env*) return 1 ;; esac
+  done
+  return 0
+}
 case "${CLAUDE_AGENT_JOB:-}" in
   ask-*)
+    _no="An answer run may only read files in the vylo folder (not settings, keys or .env files)."
     case "$tool" in
-      Read|Grep|Glob) exit 0 ;;
+      Read)
+        _f=$(jq -r '.tool_input.file_path // empty' <<<"$in")
+        [ -n "$_f" ] && answer_path_ok "$_f" || decide deny "$_no"
+        exit 0 ;;
+      Grep|Glob)
+        answer_path_ok "$(jq -r '.tool_input.path // empty' <<<"$in")" || decide deny "$_no"
+        if [ "$tool" = Grep ]; then
+          case "$(jq -r '.tool_input.glob // empty' <<<"$in")" in *.env*) decide deny "$_no" ;; esac
+        else                                             # the pattern may carry a path of its own
+          _g=$(jq -r '.tool_input.pattern // empty' <<<"$in")
+          case "/$_g/" in //*|/~*|*/../*) decide deny "$_no" ;; esac
+        fi
+        exit 0 ;;
       mcp__*)
         _rest=${tool#mcp__}; _server=${_rest%%__*}; _name=${_rest#*__}
         case "$_server" in wheelseye-jira-mcp|plugin_github_github) ;; *) decide deny "An answer run may only read: ${_server} is not available to it." ;; esac
@@ -63,7 +97,6 @@ case "${CLAUDE_AGENT_JOB:-}" in
 esac
 
 # ---------------------------------------------------------------- base copies (several sessions per person)
-VYLO=${CLAUDE_GUARD_VYLO_DIR:-$HOME/Documents/code/vylo}
 MS=""
 SESSIONS_HELPER=/usr/local/bin/agent-max-sessions   # by absolute path: the agent can put its own first on PATH
 if [ "$(realpath "$0" 2>/dev/null)" != /usr/local/bin/claude-guard.sh ] && [ -x "$(dirname "$0")/agent-max-sessions" ]; then

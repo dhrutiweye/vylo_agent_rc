@@ -64,6 +64,22 @@ class TestArgv(unittest.TestCase):
         self.assertIn("ANSWER:", preamble); self.assertIn("CANNOT_ANSWER:", preamble)
         self.assertNotIn("what port", " ".join(argv))
 
+    def test_ask_argv_allows_only_read_tools_and_sends_every_tool_to_the_guard(self):
+        # C1: --disallowedTools is only a block list, and the managed PreToolUse matcher never sees Read/Grep/Glob/
+        # WebFetch/Agent/Skill/...: an answer run gets an allow list of built-ins and a catch-all hook to the guard.
+        argv = self.m.build_argv("ask", req("ask", "what port?", ask="a0123456789", asker="srejan"))
+        self.assertEqual(argv.count("--tools"), 1)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(argv.count("--settings"), 1)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertNotIn("\n", argv[argv.index("--settings") + 1])
+        self.assertEqual(settings, {"hooks": {"PreToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": "/usr/local/bin/claude-guard.sh"}]}]}})
+        self.assertEqual(argv[-2:], ["--disallowedTools", ASK_DISALLOWED])  # still last, still exactly this list
+        for mode in ("task", "doit"):
+            other = self.m.build_argv(mode, req(mode))
+            self.assertNotIn("--tools", other); self.assertNotIn("--settings", other)
+
     def test_bad_requests_are_refused(self):
         for bad in ({**req(), "session_uuid": "not-a-uuid"}, {**req(), "mode": "shell"}):
             with self.assertRaises(ValueError):

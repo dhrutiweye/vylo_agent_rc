@@ -15,7 +15,7 @@ pass=0; fail=0
 t() {  # expected tool input(command or JSON) [cwd]
   local want=$1 tool=$2 input=$3 cwd=${4:-$T/on-feature-x} json out got
   if [ "$tool" = Bash ]; then json=$(jq -nc --arg c "$input" --arg d "$cwd" '{tool_name:"Bash",cwd:$d,session_id:"s",tool_input:{command:$c}}')
-  else json=$(jq -nc --arg t "$tool" --argjson i "${input:-{\}}" '{tool_name:$t,cwd:"/",session_id:"s",tool_input:$i}'); fi
+  else json=$(jq -nc --arg t "$tool" --arg d "${4:-/}" --argjson i "${input:-{\}}" '{tool_name:$t,cwd:$d,session_id:"s",tool_input:$i}'); fi
   out=$("$GUARD" <<<"$json" | jq -r '.hookSpecificOutput.permissionDecision // empty')
   got=${out:-allow}
   if [ "$got" = "$want" ]; then pass=$((pass+1)); else fail=$((fail+1)); printf 'FAIL want=%-5s got=%-5s %s :: %s\n' "$want" "$got" "$tool" "$input"; fi
@@ -248,7 +248,34 @@ t deny  mcp__claude_ai_Gmail__search_threads '{}'; t deny mcp__claude-code-remot
 t deny  mcp__wheelseye-jira-mcp-evil__get_x '{}'; t allow mcp__wheelseye-jira-mcp__get '{}'
 t deny  Bash "git log"; t deny Bash "ls"; t deny Edit '{"file_path":"/tmp/x"}'; t deny Write '{"file_path":"/tmp/x"}'
 t deny  NotebookEdit '{"notebook_path":"/tmp/x"}'; t deny MultiEdit '{"file_path":"/tmp/x"}'; t deny WebFetch '{}'
-t allow Read '{"file_path":"/tmp/x"}'; t allow Grep '{}'; t allow Glob '{}'
+# Read/Grep/Glob only inside the vylo folder (C1). Replaces "Read /tmp/x allow" and "Grep/Glob {} allow" (cwd /).
+mkdir -p "$V/repo1/sub" "$V/x"; : >"$V/repo1/sub/a.txt"; : >"$V/x/.env.production"
+t allow Read "{\"file_path\":\"$V/repo1/sub/a.txt\"}"; t allow Read "{\"file_path\":\"$V/notes.md\"}"
+t allow Read '{"file_path":"sub/a.txt"}' "$V/repo1"                    # relative to the run's cwd
+t deny  Read '{"file_path":"/tmp/x"}'; t deny Read '{"file_path":"/etc/passwd"}'; t deny Read '{}' "$V"
+t deny  Read "{\"file_path\":\"$HOME/.claude.json\"}"; t deny Read '{"file_path":"~/.claude.json"}' "$V"
+t deny  Read "{\"file_path\":\"$HOME/.aws/credentials\"}"; t deny Read '{"file_path":"/proc/self/environ"}' "$V"
+t deny  Read "{\"file_path\":\"$V/x/.env.production\"}"; t deny Read "{\"file_path\":\"$V/x/stage.env\"}"
+t deny  Read "{\"file_path\":\"$V/x/.env\"}"; t deny Read "{\"file_path\":\"$V/.envs/prod.yml\"}"
+t deny  Read "{\"file_path\":\"$V/../secret\"}"; t deny Read "{\"file_path\":\"$V-evil/x\"}"
+t deny  Read '{"file_path":"../../etc/passwd"}' "$V/repo1"
+t allow Grep '{"pattern":"x"}' "$V"; t allow Grep '{"pattern":"x"}' "$V/repo1"; t allow Glob '{"pattern":"**/*.java"}' "$V"
+t allow Grep "{\"pattern\":\"x\",\"path\":\"$V/repo1\"}"; t allow Glob "{\"pattern\":\"*.md\",\"path\":\"$V\"}"
+t deny  Grep '{}'; t deny Glob '{}'                                     # no path and cwd / (outside vylo)
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$HOME\"}" "$V"; t deny Glob "{\"pattern\":\"*\",\"path\":\"$HOME/.ssh\"}" "$V"
+t deny  Grep "{\"pattern\":\"KEY\",\"path\":\"$V\",\"glob\":\"*.env*\"}"
+t deny  Glob '{"pattern":"/home/*/.aws/*"}' "$V"; t deny Glob '{"pattern":"../**/*"}' "$V"
+ln -s "$HOME/secret" "$V/x/link"; ln -s /etc "$V/x/etc"
+t deny  Read "{\"file_path\":\"$V/x/link\"}"; t deny Grep "{\"pattern\":\"x\",\"path\":\"$V/x/etc\"}"
+t deny  ReadMcpResourceTool '{"server":"wheelseye-jira-mcp","uri":"x"}'; t deny ListMcpResourcesTool '{}'
+t deny  Skill '{"skill":"x"}'; t deny Agent '{"prompt":"x"}'; t deny Task '{"prompt":"x"}'
+t deny  WebSearch '{"query":"x"}'; t deny EnterWorktree '{}'; t deny Monitor '{}'; t deny SomethingNew '{}'
+REALHOME=$HOME; export HOME=$T CLAUDE_GUARD_VYLO_DIR=$T                 # even if the vylo folder held the home
+mkdir -p "$T/.claude" "$T/.config" "$T/.ssh"
+t deny  Read "{\"file_path\":\"$T/.claude.json\"}"; t deny Read "{\"file_path\":\"$T/.claude/settings.json\"}"
+t deny  Read "{\"file_path\":\"$T/.config/gh/hosts.yml\"}"; t deny Read "{\"file_path\":\"$T/.ssh/id_ed25519\"}"
+t deny  Grep "{\"pattern\":\"x\",\"path\":\"$T/.ssh\"}"; t allow Read "{\"file_path\":\"$T/vylo/repo1/sub/a.txt\"}"
+export HOME=$REALHOME CLAUDE_GUARD_VYLO_DIR=$V
 NP=$(mktemp -d); printf 'jira\n' >"$NP/mcp-allow.txt"; : >"$NP/mcp-all-users.txt"   # the person's own allow list still applies
 MCP_POLICY_DIR=$NP t allow mcp__wheelseye-jira-mcp__jira_mcp-jira_search '{}'
 MCP_POLICY_DIR=$NP t deny  mcp__plugin_github_github__get_pull_request '{}'

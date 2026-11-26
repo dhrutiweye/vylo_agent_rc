@@ -11,7 +11,9 @@ then runs a headless `claude -p` in the vylo folder: --session-id on a thread's 
 it. The prompt goes in on stdin, never on the command line (a DM starting with "-" is not an option, and other users
 cannot read it from /proc). CLAUDE_AGENT_JOB=chat-REF (task, doit) or ask-REF (ask) makes the guard refuse, rather
 than ask about, anything needing approval, and tags the audit rows. An ask run gets no Bash, no web, no writes and no
-subagents (--disallowedTools); which MCP tools it may use is the guard's answer-mode rule.
+subagents: only Read/Grep/Glob of the built-ins (--tools, plus --disallowedTools), and a catch-all PreToolUse hook
+(--settings) sends every tool call to the guard, whose answer-mode rule keeps reads inside the vylo folder and MCP to
+the read tools of Jira and GitHub.
 
 The full output is kept in ~/.claude/chat-results/REF.txt (600); one result goes to the outbox:
     task / doit   needs_you if a line starts "NEEDS YOU:", failed on a non-zero exit or timeout, else ok
@@ -39,6 +41,12 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 MODE_OF = {"t": "task", "a": "ask", "d": "doit"}
 ASK_DISALLOWED = ("Bash,Edit,Write,NotebookEdit,MultiEdit,WebFetch,WebSearch,Agent,Read(~/.claude/**),"
                   "Read(~/.config/**),Read(~/.ssh/**),Read(**/*.env)")
+ASK_TOOLS = "Read,Grep,Glob"        # --tools: the only built-ins an answer run has (an allow list, unlike --disallowedTools)
+# --settings: one more PreToolUse hook, matching EVERY tool, so the guard's answer-mode rule sees Read/Grep/Glob and
+# anything else (the managed matcher only covers Bash, MCP and the edit tools).
+ASK_SETTINGS = json.dumps({"hooks": {"PreToolUse": [
+    {"matcher": ".*", "hooks": [{"type": "command", "command": "/usr/local/bin/claude-guard.sh"}]}]}},
+    separators=(",", ":"))
 TASK_PREAMBLE = (
     "{user} gave you this task in Google Chat. Nobody is watching this run and nobody can answer questions or "
     "approve anything: do not wait for input. Anything that needs approval will be refused; when that happens, or "
@@ -87,8 +95,8 @@ def build_argv(mode, request):
     who, asker = _who(), str(request.get("asker") or "a colleague")
     preamble = {"task": TASK_PREAMBLE, "doit": DOIT_PREAMBLE, "ask": ASK_PREAMBLE}[mode]
     argv += ["--append-system-prompt", preamble.format(user=who, asker=asker)]
-    if mode == "ask":                       # last: the option takes a list, so nothing may follow it
-        argv += ["--disallowedTools", ASK_DISALLOWED]
+    if mode == "ask":                       # --disallowedTools last: the option takes a list, so nothing may follow it
+        argv += ["--tools", ASK_TOOLS, "--settings", ASK_SETTINGS, "--disallowedTools", ASK_DISALLOWED]
     return argv
 
 
