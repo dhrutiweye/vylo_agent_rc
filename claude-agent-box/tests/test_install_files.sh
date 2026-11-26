@@ -21,7 +21,7 @@ echo "== installer"
 for f in usr/local/lib/claude-agent/agent_sessions.py usr/local/bin/agent-max-sessions usr/local/bin/sessions-enable \
          etc/systemd/system/claudeagents.slice usr/local/bin/claude-agent-monitor \
          etc/systemd/system/claude-agent-monitor.service etc/systemd/system/claude-agent-monitor.timer \
-         usr/local/bin/lock-box-rules; do
+         usr/local/bin/lock-box-rules usr/local/bin/set-litellm-key.sh; do
   grep -q "$(basename "$f")" "$I"; ok $? "install-box.sh installs $f"
 done
 grep -q 'agent-sessions.conf' "$I"; ok $? "install-box.sh installs agent-sessions.conf"
@@ -38,6 +38,7 @@ grep -q '^ADMIN_PERSON=' "$R/etc/claude-agent/bridge.env.example"; ok $? "bridge
 echo "== what every agent reads"
 grep -q '\.worktrees' "$C"; ok $? "CLAUDE.md: work in .worktrees"
 grep -q 'at most 2 helpers' "$C"; ok $? "CLAUDE.md: at most 2 helpers"
+grep -q 'set_session_title' "$C" && grep -q 'AGENT_NAME' "$C"; ok $? "CLAUDE.md: sessions are titled with the agent name"
 grep -q 'worktree remove' "$C"; ok $? "CLAUDE.md: remove the worktree when done"
 grep -q 'If `agent-max-sessions` prints more than 1' "$C"; ok $? "CLAUDE.md: the worktree rule is only for several-session people"
 jq -e '.hooks.PreToolUse[0].matcher | test("MultiEdit")' "$R/etc/claude-code/managed-settings.json" >/dev/null; ok $? "guard sees MultiEdit"

@@ -46,6 +46,8 @@ from agent_outbox import label
 log = logging.getLogger("chat_bridge")
 
 CODE_RE = re.compile(r"^[A-Za-z0-9_\-#.:~+/=]{16,}$")      # an OAuth code: one long token, no spaces
+LITELLM_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_-]{16,200}$")  # a LiteLLM key, pasted alone; checked before CODE_RE
+SET_LITELLM_KEY = "/usr/local/bin/set-litellm-key.sh"
 HI_WORDS = {"hi", "hello", "hey", "start", "login", "relogin"}
 WAIT_CLEARS = {"prompt", "tool", "stop", "session_end", "session_start"}
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{6,100}$")
@@ -347,7 +349,9 @@ class Bridge:
             self.on_yes(person, m["space"])
             return
         self.pending.pop(person["linux_user"], None)       # anything else withdraws an unanswered "are you sure"
-        if low in HI_WORDS:
+        if LITELLM_KEY_RE.match(text.strip()):              # before the sign-in branches: a key is never an OAuth code
+            self.on_litellm_key(person, m["space"], text.strip())
+        elif low in HI_WORDS:
             self.on_hi(person, m["space"])
         elif low == "status":
             self.on_status(person, m["space"])
@@ -418,6 +422,24 @@ class Bridge:
                                   'Say "status" any time.' % (name, self.link(sid)))
         else:
             self.chat.send(space, "You're signed in and your agent is starting. Say \"status\" in a minute for its link.")
+
+    def on_litellm_key(self, person, space, key):
+        """Their own LiteLLM key, pasted alone in the DM. The key goes to set-litellm-key.sh on stdin and is never
+        logged, audited or repeated; only the outcome is."""
+        user = person["linux_user"]
+        result = self.host.set_litellm_key(user, key)
+        log.info("litellm key from %s: %s", user, result)
+        self._audit(user, "litellm_key", result=result)
+        if result == "saved":
+            self.chat.send(space, "Saved your LiteLLM key; your agent now uses it for Jira. Start a new session in the "
+                                  "Claude app (or /mcp, then reconnect, in one already open). You can delete your "
+                                  "message with the key from this chat.")
+        elif result == "rejected":
+            self.chat.send(space, "The gateway did not accept that key, so nothing changed. Check it is your staging "
+                                  "LiteLLM key from Sarkaar and paste it again, on its own.")
+        else:
+            self.chat.send(space, "I couldn't save your key just now; nothing changed. Try again in a few minutes, "
+                                  "or tell your admin.")
 
     def on_status(self, person, space):
         name, user = person["name"], person["linux_user"]
@@ -1068,6 +1090,17 @@ class SystemHost:
         if not SESSION_RE.match(sid):
             raise ValueError("bad session id")
         self._restart_with(user, 'rm -f "$HOME/.claude/agent-fresh" "$1"; printf "%s\\n" "$2" > "$HOME/.claude/agent-session-id"', sid)
+
+    def set_litellm_key(self, user, key):
+        """'saved', 'rejected' (the gateway said 401/403) or 'error'. The key travels on stdin only."""
+        try:
+            r = subprocess.run([SET_LITELLM_KEY, "--user", user, "--yes"], input=key + "\n",
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return "error"
+        if r.returncode == 0:
+            return "saved"
+        return "rejected" if "rejected the key" in r.stderr else "error"
 
     def take_outbox(self, user):
         import pwd

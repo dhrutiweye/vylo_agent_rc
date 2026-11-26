@@ -22,7 +22,7 @@ chk "docker can run a container" docker run --rm hello-world
 chk "bridge libraries import" /usr/local/lib/claude-agent/venv/bin/python -c 'import google.cloud.pubsub_v1, google.auth, requests'
 
 echo "-- platform files"
-for f in /usr/local/bin/{agent-start,agent-run,claude-guard.sh,claude-audit.sh,add-colleague.sh,remove-colleague.sh,vylo-mirror-sync.sh,claude-agent-seed-template.sh,claude-agent-report,gh-token-check.sh,set-gh-token.sh,jira-token-check.sh,set-jira-token.sh,notify-me,agent-job,agent-job-exec,claude-agent-jobs,agent-max-sessions,sessions-enable,claude-agent-monitor} \
+for f in /usr/local/bin/{agent-start,agent-run,claude-guard.sh,claude-audit.sh,add-colleague.sh,remove-colleague.sh,vylo-mirror-sync.sh,claude-agent-seed-template.sh,claude-agent-report,gh-token-check.sh,set-gh-token.sh,jira-token-check.sh,set-jira-token.sh,set-litellm-key.sh,notify-me,agent-job,agent-job-exec,claude-agent-jobs,agent-max-sessions,sessions-enable,claude-agent-monitor} \
          /usr/local/lib/claude-agent/{chat_bridge.py,agent_outbox.py,agent_jobs.py,agent_sessions.py} /etc/claude-code/{managed-settings.json,mcp-allow.txt,CLAUDE.md,agent-jobs.env}; do
   [ -e "$f" ] && ok "$f" || bad "missing $f"
 done

@@ -39,6 +39,7 @@ class FakeHost:
         self.titles = {}                 # transcript id -> title
         self.running = 0                 # commands the agent is running
         self.max = 1                     # sessions this person's agent may serve (agent-max-sessions)
+        self.litellm_result = "saved"
 
     def max_sessions(self, user):
         return self.max
@@ -52,6 +53,9 @@ class FakeHost:
 
     def start_login(self, user):
         self.calls.append(("start_login", user)); return self.url
+
+    def set_litellm_key(self, user, key):
+        self.calls.append(("set_litellm_key", user, key)); return self.litellm_result
 
     def send_code(self, user, code):
         self.calls.append(("send_code", user, code))
@@ -251,6 +255,55 @@ class TestOnboarding(Base):
         self.addCleanup(logging.getLogger("chat_bridge").removeHandler, h)
         self.b.handle_event(classic("hi")); self.b.handle_event(classic(CODE)); self.b.handle_event(classic("hi", email="x@y.test"))
         self.assertFalse([r for r in records if CODE in r.getMessage()])
+
+
+KEY = "sk-Ab12Cd34Ef56Gh78Ij90Kl"
+
+
+class TestLitellmKey(Base):
+    def capture(self):
+        records = []
+        h = logging.Handler(); h.emit = records.append
+        lg = logging.getLogger("chat_bridge"); lg.addHandler(h); lg.setLevel(logging.DEBUG)
+        self.addCleanup(lg.removeHandler, h)
+        return records
+
+    def audit_text(self, user="asha"):
+        with open(os.path.join(self.audit, user + ".jsonl")) as f:
+            return f.read()
+
+    def test_a_pasted_key_is_saved_for_that_person_only(self):
+        self.activate(); records = self.capture()
+        self.b.handle_event(classic("  %s \n" % KEY))
+        self.assertEqual(self.host.calls, [("set_litellm_key", "asha", KEY)])
+        self.assertIn("Saved your LiteLLM key", self.chat.last())
+        self.assertIn('"event": "litellm_key"', self.audit_text()); self.assertIn('"result": "saved"', self.audit_text())
+        for where in [r.getMessage() for r in records] + [self.audit_text()] + [t for _, t in self.chat.sent]:
+            self.assertNotIn(KEY, where)
+
+    def test_a_rejected_key_changes_nothing_and_says_so(self):
+        self.activate(); self.host.litellm_result = "rejected"
+        self.b.handle_event(classic(KEY))
+        self.assertIn("did not accept", self.chat.last()); self.assertNotIn(KEY, self.chat.last())
+
+    def test_an_error_is_reported_without_the_key(self):
+        self.activate(); self.host.litellm_result = "error"
+        self.b.handle_event(classic(KEY))
+        self.assertIn("couldn't save", self.chat.last())
+
+    def test_during_sign_in_a_key_is_never_typed_as_the_oauth_code(self):
+        self.b.handle_event(classic("hi")); self.b.handle_event(classic(KEY))
+        self.assertNotIn("send_code", self.host.names()); self.assertIn("set_litellm_key", self.host.names())
+        self.assertEqual(self.person()["status"], "login_started")
+
+    def test_a_key_inside_a_sentence_or_another_token_is_not_taken(self):
+        self.activate()
+        self.b.handle_event(classic("my key is " + KEY)); self.b.handle_event(classic("sk-short"))
+        self.assertNotIn("set_litellm_key", self.host.names())
+
+    def test_the_oauth_code_still_signs_in(self):
+        self.b.handle_event(classic("hi")); self.b.handle_event(classic(CODE))
+        self.assertIn("send_code", self.host.names())
 
 
 class TestStatusAndHelp(Base):

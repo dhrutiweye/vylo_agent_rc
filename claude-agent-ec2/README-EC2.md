@@ -150,8 +150,10 @@ Audit logs (metadata only, no prompt text) are in `/var/log/claude-agent/<name>.
 
 - Docker builds run outside the per-user CPU/RAM caps, so one person's image build can use the whole box.
 - Colleagues' own Claude plans set their usage limits. Nothing here caps spend.
-- PRs, pushes and Jira changes carry each colleague's own GitHub and Jira user. The LiteLLM key is shared by everyone, so rotate it
-  by re-running `configure-box.sh` and answering the Jira step again.
+- PRs, pushes and Jira changes carry each colleague's own GitHub and Jira user. The LiteLLM key is shared by everyone. When it
+  changes, run `sudo set-litellm-key.sh` (hidden prompt; `--host` if the gateway moved too). It checks the key against the
+  gateway first, then rewrites it in the starter kit AND every agent home. Re-running `configure-box.sh` only rebuilds the
+  kit, so existing colleagues would keep the old key. Open sessions pick the new key up on their next session or `/mcp` reconnect.
 - Claude's Remote Control needs each colleague's Claude account to be on a plan that includes it.
 
 ## GitHub tokens (fine-grained)

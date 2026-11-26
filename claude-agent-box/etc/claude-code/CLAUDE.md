@@ -50,6 +50,14 @@ After the branch is pushed and the draft PR is open, remove the worktree (the br
 
 Never remove a worktree or delete a branch you did not make in this session.
 
+## Session titles (several sessions only)
+
+If `agent-max-sessions` prints more than 1, start every new session by giving it a title, before anything else:
+call the `set_session_title` tool (Claude's own session tools) with `<agent name> · <topic>`, where the agent name is
+`echo "$AGENT_NAME"` (for example `srejan-agent`) and the topic is three to six words from the user's first message
+(for example `srejan-agent · Voicelog latest changes`). When the topic clearly changes, set it again with the same
+prefix. If the tool is missing or refused, carry on and do not retry; the title is a convenience, not the task.
+
 ## Helpers (subagents)
 
 Split work only when the parts are independent, and run at most 2 helpers at a time. A helper that edits files
