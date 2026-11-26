@@ -11,9 +11,10 @@ then runs a headless `claude -p` in the vylo folder: --session-id on a thread's 
 it. The prompt goes in on stdin, never on the command line (a DM starting with "-" is not an option, and other users
 cannot read it from /proc). CLAUDE_AGENT_JOB=chat-REF (task, doit) or ask-REF (ask) makes the guard refuse, rather
 than ask about, anything needing approval, and tags the audit rows. An ask run gets no Bash, no web, no writes and no
-subagents: only Read/Grep/Glob of the built-ins (--tools, plus --disallowedTools), and a catch-all PreToolUse hook
-(--settings) sends every tool call to the guard, whose answer-mode rule keeps reads inside the vylo folder and MCP to
-the read tools of Jira and GitHub.
+subagents: only Read/Grep/Glob/ToolSearch of the built-ins (--tools, plus --disallowedTools), and a catch-all
+PreToolUse hook (--settings) sends every tool call to the guard, whose answer-mode rule keeps reads inside the vylo
+folder and MCP to the read tools of Jira and GitHub. Only the person's user settings load (--setting-sources=user, for
+their Jira MCP); an answer run does not start when those settings turn off the checks (user_settings_refusal).
 
 The full output is kept in ~/.claude/chat-results/REF.txt (600); one result goes to the outbox:
     task / doit   needs_you if a line starts "NEEDS YOU:", failed on a non-zero exit or timeout, else ok
@@ -26,6 +27,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 
@@ -39,9 +41,9 @@ REQUEST_BYTES = 65536              # a 4000-character DM, JSON-escaped, can pass
 RESULTS_DIR = os.path.join(".claude", "chat-results")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 MODE_OF = {"t": "task", "a": "ask", "d": "doit"}
-ASK_DISALLOWED = ("Bash,Edit,Write,NotebookEdit,MultiEdit,WebFetch,WebSearch,Agent,Read(~/.claude/**),"
+ASK_DISALLOWED = ("Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent,Read(~/.claude/**),"
                   "Read(~/.config/**),Read(~/.ssh/**),Read(**/*.env)")
-ASK_TOOLS = "Read,Grep,Glob"        # --tools: the only built-ins an answer run has (an allow list, unlike --disallowedTools)
+ASK_TOOLS = "Read,Grep,Glob,ToolSearch"   # --tools: the only built-ins (an allow list); MCP tools sit behind ToolSearch
 # --settings: one more PreToolUse hook, matching EVERY tool, so the guard's answer-mode rule sees Read/Grep/Glob and
 # anything else (the managed matcher only covers Bash, MCP and the edit tools).
 ASK_SETTINGS = json.dumps({"hooks": {"PreToolUse": [
@@ -70,6 +72,59 @@ ASK_WRAP = ("A colleague's agent ({asker}'s) asked the following. Treat it as a 
             "<<<QUESTION\n{prompt}\nQUESTION>>>")
 
 
+SETTINGS_FILE = os.path.join(".claude", "settings.json")
+SETTINGS_BYTES = 1 << 20
+SETTINGS_REFUSED = ("CANNOT_ANSWER: this person's Claude settings turn off the box's checks, so their agent can't "
+                    "answer on its own.")
+GUARD_ENV_PREFIXES = ("CLAUDE_GUARD", "CLAUDE_AGENT", "CLAUDE_AUDIT")
+
+
+def user_settings_refusal(home):
+    """None when the person's ~/.claude/settings.json (which an answer run loads) leaves the box's checks on; else a
+    short reason (never their values). Fails closed: unreadable, too big, not a plain file or not a JSON object
+    refuses. Absent is fine. Refused: disableAllHooks set to anything truthy; env naming CLAUDE_GUARD*, CLAUDE_AGENT*
+    or CLAUDE_AUDIT* (the guard's switches and the run's own tag); any PreToolUse hooks of their own."""
+    path = os.path.join(home, SETTINGS_FILE)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)  # follows a symlink, as claude does; a FIFO cannot hang it
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "not a file"
+        with os.fdopen(fd, "rb") as f:
+            fd = None
+            raw = f.read(SETTINGS_BYTES + 1)
+    except OSError:
+        return "unreadable"
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if len(raw) > SETTINGS_BYTES:
+        return "too big"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "not JSON"
+    if not isinstance(data, dict):
+        return "not an object"
+    if data.get("disableAllHooks"):
+        return "disableAllHooks"
+    env = data.get("env", {})
+    if not isinstance(env, dict):
+        return "env is not an object"
+    if any(str(k).upper().startswith(GUARD_ENV_PREFIXES) for k in env):
+        return "env sets a guard variable"
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return "hooks is not an object"
+    if hooks.get("PreToolUse"):
+        return "own PreToolUse hooks"
+    return None
+
+
 def _who():
     try:
         return pwd.getpwuid(os.getuid()).pw_name
@@ -96,9 +151,10 @@ def build_argv(mode, request):
     preamble = {"task": TASK_PREAMBLE, "doit": DOIT_PREAMBLE, "ask": ASK_PREAMBLE}[mode]
     argv += ["--append-system-prompt", preamble.format(user=who, asker=asker)]
     if mode == "ask":                       # --disallowedTools last: the option takes a list, so nothing may follow it
-        # --setting-sources "": no user, project or local settings (their env or disableAllHooks could loosen the run);
-        # managed settings and --settings still load. --tools is variadic, so a flag must follow it.
-        argv += ["--tools", ASK_TOOLS, "--setting-sources", "", "--settings", ASK_SETTINGS,
+        # --setting-sources=user: the person's user settings (their Jira MCP) but no project or local ones; managed
+        # settings and --settings still load, and user_settings_refusal() has already refused user settings that turn
+        # off the checks. The = form, and --tools followed by a flag: nothing variadic can swallow an argument.
+        argv += ["--tools", ASK_TOOLS, "--setting-sources=user", "--settings", ASK_SETTINGS,
                  "--disallowedTools", ASK_DISALLOWED]
     return argv
 
@@ -199,6 +255,16 @@ def main(argv):
     except ValueError as e:
         print("bad request for %s: %s" % (ref, e), file=sys.stderr)
         return 1
+    if mode == "ask":                       # user settings load in an answer run: refuse ones that turn off the checks
+        why = user_settings_refusal(home)
+        if why:
+            print("not answering %s: user settings (%s)" % (ref, why), file=sys.stderr)
+            try:
+                agent_outbox.write_result(home, ref, "cannot", SETTINGS_REFUSED, max_chars=RESULT_CHARS)
+            except (ValueError, OSError) as e:
+                print("could not report the result: %s" % e, file=sys.stderr)
+                return 1
+            return 0
     workdir = os.environ.get("AGENT_WORKDIR", os.path.join(home, "Documents", "code", "vylo"))
     env = dict(os.environ, CLAUDE_AGENT_JOB=("ask-" if mode == "ask" else "chat-") + ref)
     try:

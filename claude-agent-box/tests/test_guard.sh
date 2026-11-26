@@ -298,6 +298,8 @@ t allow Read "{\"file_path\":\"$V/repo1/src/KeyService.java\"}"; t allow Read "{
 t allow Read "{\"file_path\":\"$V/repo1/.github/workflows/ci.yml\"}"; t allow Read "{\"file_path\":\"$V/repo1/environment.md\"}"
 t deny  Skill '{"skill":"x"}'; t deny Agent '{"prompt":"x"}'; t deny Task '{"prompt":"x"}'
 t deny  WebSearch '{"query":"x"}'; t deny EnterWorktree '{}'; t deny Monitor '{}'; t deny SomethingNew '{}'
+t allow ToolSearch '{"query":"select:mcp__wheelseye-jira-mcp__jira_mcp-jira_search"}'   # only loads tool schemas
+t deny  WebFetch '{"url":"https://x"}'; t deny Skill '{"skill":"x"}'; t deny ToolSearchX '{}'; t deny toolsearch '{}'
 REALHOME=$HOME; export HOME=$T CLAUDE_GUARD_VYLO_DIR=$T                 # even if the vylo folder held the home
 mkdir -p "$T/.claude" "$T/.config" "$T/.ssh"
 t deny  Read "{\"file_path\":\"$T/.claude.json\"}"; t deny Read "{\"file_path\":\"$T/.claude/settings.json\"}"

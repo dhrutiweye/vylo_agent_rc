@@ -99,6 +99,7 @@ case "${CLAUDE_AGENT_JOB:-}" in
   ask-*)
     _no="An answer run may only read files in the vylo folder (not settings, keys or .env files)."
     case "$tool" in
+      ToolSearch) exit 0 ;;                              # only loads tool schemas (MCP tools are deferred behind it)
       Read)
         _f=$(jq -r '.tool_input.file_path // empty' <<<"$in")
         [ -n "$_f" ] && answer_path_ok "$_f" || decide deny "$_no"

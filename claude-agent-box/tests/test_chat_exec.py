@@ -18,7 +18,7 @@ import agent_outbox as ob  # noqa: E402
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "usr", "local", "bin", "agent-chat-exec")
 UUID = "11111111-2222-4333-8444-555555555555"
-ASK_DISALLOWED = ("Bash,Edit,Write,NotebookEdit,MultiEdit,WebFetch,WebSearch,Agent,Read(~/.claude/**),"
+ASK_DISALLOWED = ("Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent,Read(~/.claude/**),"
                   "Read(~/.config/**),Read(~/.ssh/**),Read(**/*.env)")
 
 
@@ -69,7 +69,8 @@ class TestArgv(unittest.TestCase):
         # WebFetch/Agent/Skill/...: an answer run gets an allow list of built-ins and a catch-all hook to the guard.
         argv = self.m.build_argv("ask", req("ask", "what port?", ask="a0123456789", asker="srejan"))
         self.assertEqual(argv.count("--tools"), 1)
-        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob,ToolSearch")   # MCP tools sit behind ToolSearch
+        self.assertNotIn("MultiEdit", " ".join(argv))
         self.assertEqual(argv.count("--settings"), 1)
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertNotIn("\n", argv[argv.index("--settings") + 1])
@@ -80,19 +81,18 @@ class TestArgv(unittest.TestCase):
             other = self.m.build_argv(mode, req(mode))
             self.assertNotIn("--tools", other); self.assertNotIn("--settings", other)
 
-    def test_ask_argv_loads_no_user_project_or_local_settings(self):
-        # A person's own settings (env, disableAllHooks, permissions) must not loosen an answer run: only managed
-        # settings and the --settings hook load. Verified on the box (claude 2.1.318) that --setting-sources "" works.
+    def test_ask_argv_loads_only_user_settings(self):
+        # Round 3: the Jira MCP config comes from the person's user settings, so they load (project and local do
+        # not); the pre-flight refuses user settings that turn off the checks. The = form: nothing variadic eats it.
         argv = self.m.build_argv("ask", req("ask", "what port?", ask="a0123456789", asker="srejan"))
-        self.assertEqual(argv.count("--setting-sources"), 1)
-        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        self.assertEqual([a for a in argv if a.startswith("--setting-sources")], ["--setting-sources=user"])
         i = argv.index("--tools")                                            # variadic: the next item must be a flag
-        self.assertEqual(argv[i + 1], "Read,Grep,Glob")
+        self.assertEqual(argv[i + 1], "Read,Grep,Glob,ToolSearch")
         self.assertTrue(argv[i + 2].startswith("--"), argv[i + 2])
         self.assertEqual(argv[-2:], ["--disallowedTools", ASK_DISALLOWED])
         self.assertNotIn("what port?", argv)
         for mode in ("task", "doit"):
-            self.assertNotIn("--setting-sources", self.m.build_argv(mode, req(mode)))
+            self.assertFalse([a for a in self.m.build_argv(mode, req(mode)) if a.startswith("--setting-sources")])
 
     def test_markers_in_the_question_cannot_end_the_quote(self):
         # M4: a QUESTION>>> inside the question would close the quote and leave the rest as instructions
@@ -184,6 +184,51 @@ class TestMain(unittest.TestCase):
         with open(path) as f:
             self.assertIn("NEEDS YOU: merge PR 12", f.read())
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def settings(self, body):
+        d = os.path.join(self.home, ".claude"); os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "settings.json"), "w") as f:
+            f.write(body if isinstance(body, str) else json.dumps(body))
+
+    def refused_without_running(self, ref="a0123456789"):
+        self.assertIsNone(self.seen("argv"))                                 # claude never started
+        msgs = ob.take(self.home, os.getuid())
+        self.assertEqual([(m["ref"], m["status"]) for m in msgs], [(ref, "cannot")])
+        self.assertEqual(msgs[0]["text"], self.m.SETTINGS_REFUSED)
+        self.assertEqual(msgs[0]["text"], "CANNOT_ANSWER: this person's Claude settings turn off the box's checks, "
+                                          "so their agent can't answer on its own.")
+
+    def test_ask_preflight_refuses_settings_that_turn_off_the_checks(self):
+        bad = [{"disableAllHooks": True}, {"disableAllHooks": 1}, {"disableAllHooks": "yes"},
+               {"env": {"CLAUDE_GUARD_VYLO_DIR": "/tmp"}}, {"env": {"CLAUDE_AGENT_JOB": ""}},
+               {"env": {"CLAUDE_AUDIT_BIN": "/bin/true"}}, {"env": "not an object"},
+               {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": []}]}}, {"hooks": "x"},
+               "{not json", "[1, 2]", ""]
+        for i, body in enumerate(bad):
+            with self.subTest(case=i):
+                self.settings(body)
+                self.put("a0123456789", req("ask", "what port?", ask="a0123456789", asker="srejan"))
+                self.run_main("a0123456789", out="ANSWER: 8443")
+                self.refused_without_running()
+                self.assertFalse(os.path.exists(os.path.join(self.home, ob.REQUESTS, "a0123456789.json")))
+
+    def test_ask_preflight_lets_ordinary_settings_and_no_settings_run(self):
+        for body in (None, {"enabledPlugins": {"github@claude-plugins-official": True},
+                            "permissions": {"allow": ["Read"]}, "env": {"FOO": "1"}, "disableAllHooks": False,
+                            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}}):
+            with self.subTest(body=body):
+                if body is not None:
+                    self.settings(body)
+                self.put("a0123456789", req("ask", "what port?", ask="a0123456789", asker="srejan"))
+                self.run_main("a0123456789", out="ANSWER: 8443")
+                self.assertIn("--setting-sources=user", self.seen("argv").splitlines())
+                self.assertEqual([(m["status"], m["text"]) for m in ob.take(self.home, os.getuid())], [("answer", "8443")])
+                os.unlink(os.path.join(self.fake, "argv"))
+
+    def test_task_and_doit_runs_skip_the_preflight(self):
+        self.settings({"disableAllHooks": True})                            # their own runs: the guard rules apply as ever
+        self.put("t7", req()); self.run_main("t7", out="done")
+        self.assertIsNotNone(self.seen("argv"))
 
     def test_ask_run_is_tagged_and_answers(self):
         self.put("a0123456789", req("ask", "what port?", ask="a0123456789", asker="srejan"))
