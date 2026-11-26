@@ -28,6 +28,24 @@ class TestLooksSecret(unittest.TestCase):
                 self.assertTrue(sec.looks_secret(s))
                 self.assertTrue(sec.looks_secret("here is the thing you asked for: " + s + " thanks"))
 
+    def test_a_litellm_key_is_caught(self):
+        # LiteLLM keys are sk- + token_urlsafe(16): 22 characters, under the old 24 minimum
+        self.assertTrue(sec.looks_secret("my key is sk-Ab12Cd34Ef56Gh78Ij90Kl"))
+        self.assertTrue(sec.looks_secret("sk-" + "Ab12-Cd34_Ef56Gh"))           # 16 after the prefix
+        self.assertFalse(sec.looks_secret("sk-short and sk-learn"))
+        self.assertFalse(sec.looks_secret("the disk-Ab12Cd34Ef56Gh78Ij90Kl page"))   # not at a word start
+
+    def test_an_aws_secret_access_key_is_caught(self):
+        aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        self.assertEqual(len(aws), 40)
+        self.assertTrue(sec.looks_secret(aws))
+        self.assertTrue(sec.looks_secret("aws_secret_access_key = " + aws + "\n"))
+        self.assertTrue(sec.looks_secret("secret:" + aws.replace("/", "+")))
+        self.assertFalse(sec.looks_secret("x" + aws))                          # 41: not that shape
+        self.assertFalse(sec.looks_secret(aws + "=="))                         # part of a longer base64 blob
+        self.assertFalse(sec.looks_secret("src/main/java/com/Vylo/web/Service2/Hx"))   # 38
+        self.assertFalse(sec.looks_secret("src/main/java/com/vylo/web/service/handler"))   # no upper or digit
+
     def test_ordinary_text_passes(self):
         for s in ["Please review the pull request and tell me what changed.",
                   "https://github.com/WeyeTech/voiceLog/pull/778",

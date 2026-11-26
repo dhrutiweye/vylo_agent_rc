@@ -1205,6 +1205,17 @@ class TestChatTasks(Base):
         self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That looks like a secret, so I did not send it.", T1))
         self.assertEqual(len(self.host.launches()), 1)
 
+    def test_a_litellm_key_in_a_sentence_is_refused_and_starts_no_task(self):
+        key = "sk-Ab12Cd34Ef56Gh78Ij90Kl"                                    # sk- + 22: a real LiteLLM key's length
+        with self.assertLogs("chat_bridge", level="DEBUG") as logs:
+            self.b.handle_event(classic("my key is " + key))
+        self.assertEqual(self.chat.last(), "That looks like a secret, so I did not send it.")
+        self.assertEqual(self.host.launches(), [])
+        self.assertNotIn("set_litellm_key", self.host.names())
+        self.assertEqual(self.state().tasks("asha"), [])
+        for where in [t[1] for t in self.chat.sent] + [self.audit_text(), self.state_text()] + logs.output:
+            self.assertNotIn(key, where)
+
     def test_a_secret_in_a_result_is_not_posted(self):
         self.b.handle_event(classic("show me the config"))
         self.result("t1", "The token is " + GH_TOKEN); self.b.check_outbox()

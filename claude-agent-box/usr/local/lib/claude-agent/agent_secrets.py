@@ -6,7 +6,9 @@ message, a false negative leaks a credential into Chat and the audit trail.
 
     looks_secret(text) -> True when any known secret shape appears anywhere in the text
 
-Shapes: OpenAI-style sk-, GitHub ghp_ and github_pat_, AWS AKIA, Slack xox?-, three-part JWT, PEM private key header,
+Shapes: sk- keys (OpenAI-style, and LiteLLM's sk- + 22), GitHub ghp_ and github_pat_, AWS AKIA, an AWS secret access
+key (exactly 40 of [A-Za-z0-9+/], bounded by anything else but =, with an upper, a lower, a digit and a / or +),
+Slack xox?-, three-part JWT, PEM private key header,
 and any long segment (32+ characters of [A-Za-z0-9_+], judged per segment: / = - . : and spaces split a token, so
 branch names, paths and SHA=... pass) holding an upper, a lower and a digit that is not pure hex (so git SHAs and
 UUIDs pass). The prefixed shapes must not start inside a word (disk-usage-... is not sk-). The text itself is never logged here.
@@ -17,7 +19,7 @@ from __future__ import annotations
 import re
 
 _SHAPES = [
-    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{24,}"),
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"),        # LiteLLM keys are sk- + 22 (token_urlsafe(16))
     re.compile(r"(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{36}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{40,}"),
     re.compile(r"(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}"),
@@ -25,6 +27,7 @@ _SHAPES = [
     re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 ]
+_AWS_SECRET = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40}(?![A-Za-z0-9+/=])")   # exactly 40, then judged below
 _LONG_TOKEN = re.compile(r"[A-Za-z0-9_+]{32,}")   # a segment: / = - . : and spaces all end one
 _HEX = re.compile(r"[0-9a-fA-F]+")
 
@@ -34,6 +37,10 @@ def looks_secret(text: str) -> bool:
         return False
     if any(p.search(text) for p in _SHAPES):
         return True
+    for tok in _AWS_SECRET.findall(text):
+        if (re.search(r"[A-Z]", tok) and re.search(r"[a-z]", tok) and re.search(r"[0-9]", tok)
+                and re.search(r"[/+]", tok)):
+            return True
     for tok in _LONG_TOKEN.findall(text):
         if (re.search(r"[A-Z]", tok) and re.search(r"[a-z]", tok) and re.search(r"[0-9]", tok)
                 and not _HEX.fullmatch(tok)):
