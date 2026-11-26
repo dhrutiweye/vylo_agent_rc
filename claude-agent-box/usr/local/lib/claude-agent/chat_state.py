@@ -110,7 +110,7 @@ class ChatState:
             a = self._find(d, ask_id)
             if a:
                 a.pop("text", None)
-                a["status"] = "done"
+                a["closed_at"] = self.now()            # status is left alone: a declined ask must stay unapproved
         self._modify(fn)
 
     def prune(self):
@@ -141,7 +141,7 @@ class ChatState:
             if t["user"] == user and t["thread"] == thread:
                 return "task", dict(t)
         for a in d["asks"]:
-            if a.get("status") == "done":
+            if a.get("closed_at") is not None:
                 continue
             if a["from"] == user and a.get("approval_thread") == thread:
                 return "approval", dict(a)

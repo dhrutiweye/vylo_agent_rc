@@ -97,10 +97,23 @@ class TestChatState(Base):
         self.st.update("aclosed0001", approval_thread="AP", received_thread="RC")
         self.st.close("aclosed0001")
         a = self.st.get("aclosed0001")
-        self.assertEqual(a["status"], "done"); self.assertNotIn("text", a)
+        self.assertEqual(a["status"], "awaiting_ok"); self.assertIsNotNone(a["closed_at"]); self.assertNotIn("text", a)
         self.assertNotIn("secret-ish", open(self.path).read())
         self.assertIsNone(self.st.item_by_thread("asha", "AP"))     # closed asks do not own threads
         self.assertIsNone(self.st.item_by_thread("ravi", "RC"))
+
+    def test_declined_or_expired_ask_stays_unapproved_after_close(self):
+        for i, status in enumerate(["declined", "expired"]):
+            ask_id = "a%010d" % i
+            self.st.new_ask("asha", "ravi", "q", ask_id)
+            self.st.update(ask_id, status=status, approval_thread="AP%d" % i, received_thread="RC%d" % i)
+            self.st.close(ask_id)
+            self.assertEqual(self.st.get(ask_id)["status"], status)
+            self.assertNotIn("text", self.st.get(ask_id))
+            self.assertIsNone(self.st.item_by_thread("asha", "AP%d" % i))
+            self.assertIsNone(self.st.item_by_thread("ravi", "RC%d" % i))
+        self.assertEqual(self.st.count_today("ask_received", "ravi"), 0)
+        self.assertEqual(self.st.count_today("ask_sent", "asha"), 2)
 
     def test_old_asks_are_pruned_after_7_days(self):
         self.st.new_ask("asha", "ravi", "old", "aold0000001")
