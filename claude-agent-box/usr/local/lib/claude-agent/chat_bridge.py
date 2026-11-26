@@ -35,7 +35,7 @@ logic is tested with fakes (tests/test_chat_bridge.py):
     EventSource  pull() -> [(ack_id, event_dict)] ; ack([ack_id])
     Chat         send(space, text, thread=None, new_thread=False) -> thread name
     Host         start_login / send_code / wait_login_ok / stop_login / start_agent /
-                 wait_session_id / service_active / session_id / take_outbox /
+                 wait_session_id / service_active / logged_in / session_id / take_outbox /
                  new_session / switch_session / agent_job / launch_run /
                  write_inbox / inbox_taken / remove_inbox
 
@@ -463,7 +463,7 @@ class Bridge:
 
     def on_hi(self, person, space):
         name, user = person["name"], person["linux_user"]
-        if person["status"] == "active" and self.host.service_active(user):
+        if person["status"] == "active" and self.host.service_active(user) and self.host.logged_in(user):
             self.chat.send(space, "You're all set. Your agent: %s" % (self.link(person.get("session_id")) or "starting up, say status in a minute"))
             return
         url = self.host.start_login(user)
@@ -1667,6 +1667,15 @@ class SystemHost:
 
     def service_active(self, user):
         return subprocess.run(["systemctl", "is-active", "--quiet", "claude-agent@%s.service" % user]).returncode == 0
+
+    def logged_in(self, user):
+        """Is Claude signed in for this user (claude auth status -> loggedIn)? True when the check itself fails, so a
+        flaky check never forces a needless re-login."""
+        try:
+            out = self._as(user, ["claude", "auth", "status"], timeout=20).stdout
+            return bool(json.loads(out).get("loggedIn"))
+        except (subprocess.SubprocessError, OSError, ValueError, AttributeError):
+            return True
 
     def session_id(self, user):
         for path in ("/home/%s/.claude/agent-session-id" % user,):

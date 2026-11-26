@@ -43,6 +43,7 @@ class FakeHost:
         self.login_ok = True
         self.session = "session_01ABC"
         self.active = True
+        self.signed_in = True            # logged_in's answer (claude auth status)
         self.next_session = None
         self.outbox = {}
         self.titles = {}                 # transcript id -> title
@@ -124,6 +125,9 @@ class FakeHost:
 
     def service_active(self, user):
         return self.active
+
+    def logged_in(self, user):
+        return self.signed_in
 
     def session_id(self, user):
         return self.session
@@ -324,6 +328,16 @@ class TestOnboarding(Base):
     def test_hi_when_active_but_service_down_signs_in_again(self):
         self.activate(); self.host.active = False; self.b.handle_event(classic("hi"))
         self.assertEqual(self.host.calls, [("start_login", "asha")])
+
+    def test_hi_when_claude_login_expired_starts_sign_in_again(self):
+        self.activate(); self.host.signed_in = False; self.b.handle_event(classic("hi"))
+        self.assertEqual(self.host.calls, [("start_login", "asha")])
+        self.assertEqual(self.person()["status"], "login_started")
+        self.assertIn(self.host.url, self.chat.last())
+
+    def test_hi_when_logged_in_still_just_resends_the_link(self):
+        self.activate(); self.host.signed_in = True; self.b.handle_event(classic("hi"))
+        self.assertEqual(self.host.calls, []); self.assertIn("claude.ai/code/session_01ABC", self.chat.last())
 
     def test_session_id_not_available_yet(self):
         self.host.session = None
