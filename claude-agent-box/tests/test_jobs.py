@@ -149,6 +149,31 @@ class TestOutbox(unittest.TestCase):
         self.assertFalse(os.path.islink(os.path.join(d, "a1.json")))
         self.assertTrue(ob.user_file_exists(self.home, UID, ob.INBOX, "a1.json"))
 
+    @unittest.skipUnless(os.geteuid() == 0, "ownership hand-over needs root")
+    def test_root_hands_directories_and_file_to_the_user(self):
+        uid, gid = 54321, 54322
+        os.chown(self.home, uid, gid)
+        old = os.umask(0o022)
+        try:
+            ob.write_user_file(self.home, uid, gid, ob.INBOX, "a0123456789.json", {"v": 1, "answer": "yes"})
+        finally:
+            os.umask(old)
+        for rel, mode in ((".claude", 0o700), (ob.INBOX, 0o700), (ob.INBOX + "/a0123456789.json", 0o600)):
+            st = os.stat(os.path.join(self.home, rel))
+            self.assertEqual((st.st_uid, st.st_gid, st.st_mode & 0o777), (uid, gid, mode), rel)
+        self.assertTrue(ob.user_file_exists(self.home, uid, ob.INBOX, "a0123456789.json"))
+        self.assertFalse(ob.user_file_exists(self.home, 0, ob.INBOX, "a0123456789.json"))
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                os.setgid(gid); os.setuid(uid)
+                code = 0 if ob.read_inbox(self.home, "a0123456789") == {"v": 1, "answer": "yes"} else 2
+            finally:
+                os._exit(code)
+        self.assertEqual(os.waitpid(pid, 0)[1], 0)
+        self.assertFalse(ob.user_file_exists(self.home, uid, ob.INBOX, "a0123456789.json"))
+
     def test_labels(self):
         self.assertEqual(ob.label("agent"), "[agent]"); self.assertEqual(ob.label("job:standup"), "[job standup]")
 

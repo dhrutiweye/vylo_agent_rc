@@ -9,8 +9,14 @@ its own user's doorbell. The reader runs as root inside a directory the colleagu
 opened without following symlinks and every file must be a regular file owned by that user with one link: a planted
 symlink or hard link cannot make root read (and post) somebody else's file.
 
-Message file: {"v": 1, "to": "self", "source": "agent" | "job:<name>", "text": "...", "ts": <epoch>}
-"to" is "self" only for now; messaging a colleague is a later phase and is refused here.
+Message files (all in ~/.claude/outbox, written by the colleague, read by root):
+  {"v": 1, "to": "self", "source": "agent" | "job:<name>", "text": "...", "ts": <epoch>}     note to its own user
+  {"v": 1, "kind": "ask", "to": "<colleague>", "ask": "a<10 hex>", "text": "...", "ts": ...}  question for a colleague
+  {"v": 1, "kind": "result", "ref": "t|a|d<id>", "status": ok|needs_you|failed|answer|cannot, "text", "ts"}
+A plain message addressed to anyone but "self" is dropped; asks go through the bridge's approval flow.
+Files root writes into a colleague's home, with the same no-symlink, owner-checked steps (write_user_file):
+  ~/.claude/inbox/<ask id>.json         the answer to an ask, read once and deleted by the asking agent (read_inbox)
+  ~/.claude/chat-requests/<name>.json   a run request for the colleague's own runner
 Standard library only, Python 3.9 compatible (the colleague side runs on the system python3).
 """
 from __future__ import annotations
