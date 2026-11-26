@@ -1915,6 +1915,11 @@ class TestSystemHostInbox(unittest.TestCase):
                 self.assertEqual(json.load(f), body)
             self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
             self.assertFalse(h.inbox_taken("asha", A1))
+            corrected = dict(body, by="person", text="Ravi corrects their agent's answer: 5")
+            h.write_inbox("asha", A1, corrected)                             # M2: a correction replaces an unread answer
+            with open(path) as f:
+                self.assertEqual(json.load(f), corrected)
+            self.assertFalse(h.inbox_taken("asha", A1))
             h.remove_inbox("asha", A1)
             self.assertTrue(h.inbox_taken("asha", A1))
             with self.assertRaises(ValueError):
