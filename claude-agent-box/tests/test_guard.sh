@@ -220,6 +220,41 @@ export CLAUDE_GUARD_MAX_SESSIONS=9                                # out of range
 t allow Bash "git commit -m x" "$B"
 unset CLAUDE_GUARD_MAX_SESSIONS CLAUDE_GUARD_VYLO_DIR
 
+echo "== chat and ask runs"
+export CLAUDE_GUARD_VYLO_DIR=$V CLAUDE_GUARD_MAX_SESSIONS=1
+for j in my-issues chat-t1 chat-d2 ask-a1; do
+  CLAUDE_AGENT_JOB=$j t deny Bash "ask-colleague anurag <<'Q'"
+done
+CLAUDE_AGENT_JOB=chat-t1 t deny Bash "/usr/local/bin/ask-colleague anurag"
+t allow Bash "ask-colleague anurag"                                   # an interactive session may ask
+export CLAUDE_AGENT_JOB=chat-t1                                       # a Chat task is held to worktree rules even with one session
+t deny  Edit "{\"file_path\":\"$B/a.txt\"}"; t allow Edit "{\"file_path\":\"$W/a.txt\"}"
+t deny  Bash "git commit -m x" "$B"; t allow Bash "git commit -m x" "$W"
+export CLAUDE_AGENT_JOB=chat-d2
+t deny  Edit "{\"file_path\":\"$B/a.txt\"}"; t allow Edit "{\"file_path\":\"$W/a.txt\"}"
+export CLAUDE_AGENT_JOB=my-issues                                     # an ordinary scheduled job keeps its old rules
+t allow Edit "{\"file_path\":\"$B/a.txt\"}"
+export CLAUDE_AGENT_JOB=ask-a1                                        # an answer run may only read
+t allow mcp__wheelseye-jira-mcp__jira_mcp-jira_search '{}'
+t allow mcp__wheelseye-jira-mcp__jira_mcp-confluence_get_page '{}'
+t allow mcp__plugin_github_github__get_pull_request '{}'
+t allow mcp__plugin_github_github__search_code '{}'
+t deny  mcp__wheelseye-jira-mcp__jira_mcp-jira_create_issue '{}'
+t deny  mcp__wheelseye-jira-mcp__jira_mcp-jira_add_comment '{}'
+t deny  mcp__plugin_github_github__create_pull_request '{"draft":true}'
+t deny  mcp__plugin_github_github__add_issue_comment '{}'
+t deny  mcp__MongoDB__find '{}'; t deny mcp__wheelseye-kubernetes-mcp__kubernetes_mcp-pods_list '{}'
+t deny  mcp__claude_ai_Gmail__search_threads '{}'; t deny mcp__claude-code-remote__list_sessions '{}'
+t deny  mcp__wheelseye-jira-mcp-evil__get_x '{}'; t allow mcp__wheelseye-jira-mcp__get '{}'
+t deny  Bash "git log"; t deny Bash "ls"; t deny Edit '{"file_path":"/tmp/x"}'; t deny Write '{"file_path":"/tmp/x"}'
+t deny  NotebookEdit '{"notebook_path":"/tmp/x"}'; t deny MultiEdit '{"file_path":"/tmp/x"}'; t deny WebFetch '{}'
+t allow Read '{"file_path":"/tmp/x"}'; t allow Grep '{}'; t allow Glob '{}'
+NP=$(mktemp -d); printf 'jira\n' >"$NP/mcp-allow.txt"; : >"$NP/mcp-all-users.txt"   # the person's own allow list still applies
+MCP_POLICY_DIR=$NP t allow mcp__wheelseye-jira-mcp__jira_mcp-jira_search '{}'
+MCP_POLICY_DIR=$NP t deny  mcp__plugin_github_github__get_pull_request '{}'
+rm -rf "$NP"
+unset CLAUDE_AGENT_JOB CLAUDE_GUARD_MAX_SESSIONS CLAUDE_GUARD_VYLO_DIR
+
 echo "== cd changes which repo a later git command means"
 t deny  Bash "cd $T/on-master && git push" "$T/on-feature-x"
 t allow Bash "cd $T/on-feature-x && git push" "$T/on-master"

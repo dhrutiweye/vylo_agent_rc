@@ -44,6 +44,24 @@ decide() {  # $1 = ask|deny   $2 = reason
 }
 protected() { [[ "$1" =~ $PROTECTED ]]; }
 
+# ---------------------------------------------------------------- answer runs (CLAUDE_AGENT_JOB=ask-*)
+# A run answering a colleague's question may only read: Read/Grep/Glob, and the read tools of the Jira and GitHub
+# MCP servers (exact server names; the verb is judged as in mcp_check). Everything else is refused. The person's own
+# MCP allow-list still applies on top (mcp_check runs after this).
+case "${CLAUDE_AGENT_JOB:-}" in
+  ask-*)
+    case "$tool" in
+      Read|Grep|Glob) exit 0 ;;
+      mcp__*)
+        _rest=${tool#mcp__}; _server=${_rest%%__*}; _name=${_rest#*__}
+        case "$_server" in wheelseye-jira-mcp|plugin_github_github) ;; *) decide deny "An answer run may only read: ${_server} is not available to it." ;; esac
+        _name=$(sed -E 's/^[a-z0-9]+_(mcp|oss)-//; s/^(notion|jira|confluence)[-_]//' <<<"$_name")
+        _first=$(sed -E 's/([a-z0-9])([A-Z])/\1_\2/g' <<<"$_name" | tr 'A-Z-' 'a-z_' | cut -d_ -f1)
+        [[ $_first =~ $READ_FIRST ]] || decide deny "An answer run may only read: ${_name} changes something." ;;
+      *) decide deny "An answer run may only read: ${tool} is not available to it." ;;
+    esac ;;
+esac
+
 # ---------------------------------------------------------------- base copies (several sessions per person)
 VYLO=${CLAUDE_GUARD_VYLO_DIR:-$HOME/Documents/code/vylo}
 MS=""
@@ -56,6 +74,7 @@ multi_session() {  # true when this person's agent serves more than one session;
     MS=${CLAUDE_GUARD_MAX_SESSIONS:-$("$SESSIONS_HELPER" 2>/dev/null)}
     [[ $MS =~ ^[1-5]$ ]] || MS=1
   fi
+  case "${CLAUDE_AGENT_JOB:-}" in chat-*) return 0 ;; esac   # a Chat run (task or do-it) is held to worktree rules whatever the person's session count
   [ "$MS" -gt 1 ]
 }
 base_copy_of() {  # $1 = path; prints the base-copy root that holds it, or nothing
@@ -329,6 +348,8 @@ scan() {  # $1 = command text; $2 = recursion depth
         [ "$arg" = - ] || wd=$(resolve_dir "$arg" "$wd") ;;
       "bash -c "*|"sh -c "*|"zsh -c "*|"bash -lc "*|"sh -lc "*)
         inner=${seg#* -*c }; inner=$(sed -E "s/^[\"']//; s/[\"']\$//" <<<"$inner"); scan "$inner" $((depth+1)) ;;
+      ask-colleague|ask-colleague\ *|*/ask-colleague|*/ask-colleague\ *)
+        [ -n "${CLAUDE_AGENT_JOB:-}" ] && decide deny "A scheduled or Chat run cannot ask a colleague: there is nobody to wait for the answer. Report the question on a 'NEEDS YOU:' line instead." ;;
       git|git\ *) check_git "$seg" ;;
       gh|gh\ *) check_gh "$seg" ;;
       curl*|wget*|http\ *|https\ *) check_http "$seg" ;;
