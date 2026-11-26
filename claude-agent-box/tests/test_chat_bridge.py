@@ -340,6 +340,29 @@ class TestOnboarding(Base):
         self.assertEqual(self.person()["status"], "login_started")
         self.assertIn(self.host.url, self.chat.last())
 
+    def test_code_after_an_expired_login_restarts_the_running_agent(self):
+        # the agent service kept running with the old login: only a restart makes Remote Control use the new one
+        self.activate(); self.host.signed_in = False
+        self.b.handle_event(classic("hi")); self.b.handle_event(classic("hi"))      # a second hi changes nothing
+        self.host.calls.clear()
+        self.b.handle_event(classic(CODE))
+        self.assertEqual(self.host.names(), ["send_code", "wait_login_ok", "stop_login", "restart", "confirm_remote_control"])
+        self.assertEqual(self.host.calls[3], ("restart", "asha"))
+        p = self.person()
+        self.assertEqual((p["status"], p["session_id"]), ("active", "session_01ABC"))
+        self.assertIn("https://claude.ai/code/session_01ABC", self.chat.last())
+        self.assertFalse(p.get("relogin"))                                   # cleared once signed in
+        self.store.update("asha", status="pending")                          # a later first-style sign-in starts it
+        self.b.handle_event(classic("hi")); self.host.calls.clear(); self.b.handle_event(classic(CODE))
+        self.assertIn("start_agent", self.host.names()); self.assertNotIn("restart", self.host.names())
+
+    def test_code_after_an_expired_login_starts_an_agent_that_has_stopped_meanwhile(self):
+        self.activate(); self.host.signed_in = False
+        self.b.handle_event(classic("hi"))
+        self.host.active = False; self.host.calls.clear()
+        self.b.handle_event(classic(CODE))
+        self.assertIn("start_agent", self.host.names()); self.assertNotIn("restart", self.host.names())
+
     def test_hi_when_logged_in_still_just_resends_the_link(self):
         self.activate(); self.host.signed_in = True; self.b.handle_event(classic("hi"))
         self.assertEqual(self.host.calls, []); self.assertIn("claude.ai/code/session_01ABC", self.chat.last())

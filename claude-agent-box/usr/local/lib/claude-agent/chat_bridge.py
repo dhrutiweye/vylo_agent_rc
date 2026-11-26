@@ -471,7 +471,10 @@ class Bridge:
             log.error("could not start sign-in for %s", name)
             self.chat.send(space, "I couldn't start the sign-in just now. Try again in a minute; if it keeps failing, tell your admin.")
             return
-        self.store.update(name, status="login_started", login_started_at=self.now())
+        fields = {"status": "login_started", "login_started_at": self.now()}
+        if person["status"] == "active":       # an expired login (or a stopped agent): on_code restarts a running one
+            fields["relogin"] = True
+        self.store.update(name, **fields)
         self.chat.send(space, "Hi %s! 1) Open this link and sign in with YOUR Claude account. 2) Paste the code it shows you back here "
                               "(as a message to me).\nSigning in also turns on Remote Control for your Claude account, so you can use "
                               "your agent from the Claude app.\n%s\nThe link works for about %d minutes." % (name, url, self.cfg.login_ttl // 60))
@@ -490,10 +493,13 @@ class Bridge:
             self.store.update(name, status="pending")
             self.chat.send(space, 'That code didn\'t work. Say "hi" to try again with a fresh link.')
             return
-        self.host.start_agent(user)
+        if person.get("relogin") and self.host.service_active(user):
+            self.host.restart_agent(user)            # still running on the expired login: Remote Control needs the new one
+        else:
+            self.host.start_agent(user)
         self.host.confirm_remote_control(user)       # the first run asks "Enable Remote Control? (y/n)"
         sid = self.host.wait_session_id(user)
-        self.store.update(name, status="active", session_id=sid, activated_at=self.now())
+        self.store.update(name, status="active", session_id=sid, activated_at=self.now(), relogin=False)
         if sid:
             self.chat.send(space, "You're signed in. Your agent \"%s-agent\" is running. Open it in the Claude app: %s\n"
                                   'Say "status" any time.' % (name, self.link(sid)))
