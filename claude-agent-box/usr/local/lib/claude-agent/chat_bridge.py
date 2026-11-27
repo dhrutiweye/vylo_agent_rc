@@ -23,9 +23,13 @@ numbered list.
 
 Name-first messages: "Yogesh, is the photo session still on Friday?" (a colleague's people or Linux name, then a comma
 or colon) goes straight to Yogesh's DM as "Dhrutiman: ..." -- no task, no agent run, no yes/no: the person typed it,
-which is its own OK. It is kept as an ask with origin "direct", born with_person, under the same secret check and daily
-limits; Yogesh answers it like any colleague question (a reply, the ask-back list, or "do it"), and the answer is
-posted to the sender's DM as "Yogesh: ..." (never their agent's inbox: no agent is waiting).
+which is its own OK. It is kept as an ask with origin "direct", born with_person, under the same secret check and its
+own daily cap (DIRECT_PER_DAY, not the agents' ask limits); Yogesh answers it like any colleague question (a reply, the
+ask-back list, or "do it"), and the answer is posted to the sender's DM as "Yogesh: ..." (never their agent's inbox: no
+agent is waiting). "Dhrutiman, yes" from Yogesh, while something from Dhrutiman or his agent waits on Yogesh, answers
+the newest such question instead of opening a new message. A bare yes/no answers an approval or the restart question
+first, else a colleague question. A colleague question older than 24 hours is no longer a plain message's candidate
+(its thread and a name reply still answer it).
 
 Tasks from Chat: the bridge never runs Claude: it posts "On it.", writes the request to
 ~/.claude/chat-requests/<ref>.json and starts agent-chat-exec as that person in a capped systemd unit
@@ -145,6 +149,8 @@ ASKS_RECEIVED_LIMIT = "%s has had %d questions today, the daily limit."
 DIRECT_POST = "%s: %s"                      # to the colleague, at the top level: "Dhrutiman: ..."
 DIRECT_NOT_SET_UP = "%s isn't set up on the bot yet."
 DIRECT_UNREACHABLE = "I couldn't reach %s in Chat just now, so it was not sent."
+DIRECT_LIMIT = "You've sent %d messages today, the daily limit."
+QUESTION_RECENT_SECONDS = 24 * 3600   # a colleague question older than this is no longer a plain message's candidate
 ASK_COPY = 'Your agent answered %s ("%s"): %s Reply to correct it.'
 ASK_ANSWER = "%s: %s"                       # to the asker: "Ravi: ..." or "Ravi's agent: ..."
 ASK_CORRECTION_POST = "%s (correction): %s"
@@ -201,6 +207,7 @@ class Config:
         self.chat_runs_at_once = int(env.get("CHAT_RUNS_AT_ONCE", "2"))
         self.asks_per_day = int(env.get("ASKS_PER_DAY", "10"))
         self.asks_received_per_day = int(env.get("ASKS_RECEIVED_PER_DAY", "20"))
+        self.direct_per_day = int(env.get("DIRECT_PER_DAY", "200"))   # a person's name-first messages (anti-loop)
         self.ask_approval_seconds = int(env.get("ASK_APPROVAL_SECONDS", "7200"))
         self.ask_dm_fallback_seconds = int(env.get("ASK_DM_FALLBACK_SECONDS", "120"))
         self.chat_result_chars = int(env.get("CHAT_RESULT_CHARS", "1500"))
@@ -595,6 +602,13 @@ class Bridge:
             return False
         target, text = found
         user, name = person["linux_user"], shown(target["name"])
+        waiting = [a for a in self.state.asks() if a.get("closed_at") is None and a.get("status") == "with_person"
+                   and a.get("handed_at") and a["from"] == target.get("linux_user") and a["to"] == user]
+        if waiting:                                        # "Dhrutiman, yes": answers what Dhrutiman (or his agent)
+            if text:                                       # asked, the newest, whatever its age; no new message
+                newest = max(waiting, key=lambda a: float(a["handed_at"]))
+                self._on_received(person, space, newest["ask"], text)
+            return True
         if target.get("status") != "active" or not target.get("chat_space"):
             self.chat.send(space, DIRECT_NOT_SET_UP % name)
             return True
@@ -610,10 +624,8 @@ class Bridge:
             return True
         with self.run_lock:
             refusal = None
-            if self.state.count_today("ask_sent", user) >= self.cfg.asks_per_day:
-                refusal = ASKS_LIMIT % self.cfg.asks_per_day
-            elif self.state.count_today("ask_received", target["linux_user"]) >= self.cfg.asks_received_per_day:
-                refusal = ASKS_RECEIVED_LIMIT % (name, self.cfg.asks_received_per_day)
+            if self.state.count_today("direct_sent", user) >= self.cfg.direct_per_day:
+                refusal = DIRECT_LIMIT % self.cfg.direct_per_day
             if refusal is None:
                 ask_id = self._new_ask_id()
                 self.state.new_ask(user, target["linux_user"], text, ask_id, status="with_person", origin="direct",
@@ -644,7 +656,8 @@ class Bridge:
             shown_ = a.get("asked_at") or a.get("approval_thread")      # the approval post went out: never before
             if a["from"] == user and a.get("status") == "awaiting_ok" and shown_:
                 found.append(("approval", a["ask"], {str(a.get("to_name") or ""), a["to"]}))
-            elif a["to"] == user and a.get("status") == "with_person" and a.get("handed_at"):
+            elif a["to"] == user and a.get("status") == "with_person" and a.get("handed_at") and \
+                    now - float(a["handed_at"]) < QUESTION_RECENT_SECONDS:   # older: its thread or a name reply
                 found.append(("question", a["ask"], {str(a.get("from_name") or ""), a["from"]}))
         waiting = self.pending.get(user)
         if waiting and waiting[2] >= now:
@@ -655,8 +668,9 @@ class Bridge:
             if now - float(t.get("last_at") or t.get("created_at") or 0) < TASK_RECENT_SECONDS:
                 found.append(("task", t["ref"], set()))
         found = [(k, key, {n.lower() for n in names if n}) for k, key, names in found]
-        if yes_no:                                          # only a yes/no answers an approval or the restart question
-            found = [f for f in found if f[0] in ("approval", "restart")]
+        if yes_no:                                          # an approval or the restart question has first claim;
+            first = [f for f in found if f[0] in ("approval", "restart")]   # else it answers a colleague question
+            found = first or [f for f in found if f[0] == "question"]
         else:
             found = [f for f in found if f[0] not in ("approval", "restart")]
         named = [f for f in found if any(re.search(r"(?<!\w)%s(?!\w)" % re.escape(n), low) for n in f[2])]
@@ -1497,11 +1511,13 @@ class Bridge:
                 if ask.get("run_status") in RUN_BUSY:
                     self._reply(space, "Your agent is already on it.")
                     return
-                prompt = DOIT_PROMPT_DIRECT if ask.get("origin") == "direct" else DOIT_PROMPT
+                direct = ask.get("origin") == "direct"
                 request = {"mode": "doit", "session_uuid": str(uuid.uuid4()), "resume": False, "ask": ask_id,
-                           "asker": ask["from_name"], "prompt": prompt % (
+                           "asker": ask["from_name"], "prompt": (DOIT_PROMPT_DIRECT if direct else DOIT_PROMPT) % (
                                shown(ask["from_name"]), shown(ask["to_name"]), defuse_markers(ask["text"]),
                                shown(ask["from_name"]))}
+                if direct:                                 # agent-chat-exec: "Dhrutiman asked you", not "'s agent"
+                    request["direct"] = True
                 started = self._start_ask_run(ask_id, "d" + ask_id[1:], request)
                 if started:
                     self._audit_ask(ask, "do_it", len(ask["text"]))

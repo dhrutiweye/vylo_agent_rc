@@ -2402,15 +2402,86 @@ class TestDirectMessages(AskBase):
         self.assertNotIn(GH_TOKEN, self.file_text(os.path.join(self.audit, "dhrutiman.jsonl")))
         self.assertNotIn(GH_TOKEN, self.file_text(self.state_file))
 
-    def test_the_daily_limits_apply(self):
-        self.cfg.asks_per_day = 2
-        self.dm("Yogesh, one?"); self.dm("Yogesh, two?"); self.dm("Yogesh, three?")
-        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "You've asked 2 questions today, the daily limit."))
-        self.assertEqual(len(self.sent_to(DM5)), 2)
-        self.cfg.asks_per_day = 10; self.cfg.asks_received_per_day = 2
-        self.dm("Yogesh, four?", who="asha")
-        self.assertEqual(self.chat.sent[-1], (DM1, "Yogesh has had 2 questions today, the daily limit."))
-        self.assertEqual(len(self.sent_to(DM5)), 2); self.assertEqual(len(self.direct_asks()), 2)
+    def test_direct_messages_have_their_own_daily_cap(self):
+        for i in range(200):                                                  # past ASKS_PER_DAY (10) and
+            self.dm("Yogesh, note %d" % i)                                    # ASKS_RECEIVED_PER_DAY (20)
+        self.assertEqual(len(self.sent_to(DM5)), 200)
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Sent to Yogesh."))
+        self.dm("Yogesh, one more")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "You've sent 200 messages today, the daily limit."))
+        self.assertEqual(len(self.sent_to(DM5)), 200); self.assertEqual(len(self.direct_asks()), 200)
+        self.ask(to="yogesh", user="dhrutiman")                               # agent asks keep their own limits
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, 'To Yogesh: "%s" \u2014 send? yes / no' % Q))
+        self.cfg.direct_per_day = 2
+        self.dm("Yogesh, hi", who="asha"); self.dm("Yogesh, hi again", who="asha"); self.dm("Yogesh, x", who="asha")
+        self.assertEqual(self.chat.sent[-1], (DM1, "You've sent 2 messages today, the daily limit."))
+        self.assertEqual(len(self.sent_to(DM5)), 202)
+
+    def test_a_bare_yes_or_no_answers_a_question_when_no_approval_waits(self):
+        self.dm("Yogesh, " + PHOTO)
+        self.ask(to="dhrutiman", user="ysingla")                              # Yogesh's agent's question waits too
+        self.dm("yes", who="yogesh")                                          # the approval has first claim
+        self.assertEqual(self.state().get(A1)["status"], "asking_agent")
+        self.assertEqual(self.direct_asks()[0]["status"], "with_person")
+        self.dm("yes", who="yogesh")                                          # nothing to approve: the question
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: yes"))
+        self.assertEqual(self.direct_asks()[0]["status"], "answered")
+        self.dm("Yogesh, lunch at 1?"); self.dm("Yogesh, lunch at 1?", who="asha")
+        self.dm("no", who="yogesh")                                           # two questions: asked back, no new task
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, 'Which one is this for?\n1. Dhrutiman\'s question: "lunch at 1?"\n'
+                                                     '2. Asha\'s question: "lunch at 1?"\nReply with the number or '
+                                                     'the name.'))
+        self.dm("2", who="yogesh")
+        self.assertEqual(self.chat.sent[-2], (DM1, "Yogesh: no"))
+        self.assertEqual(self.state().tasks("ysingla"), [])
+
+    def test_an_agents_question_takes_a_bare_yes_too(self):
+        self.ask(); self.say("yes"); self.result(A1, "needs ravi", "cannot")
+        self.say("no", who="ravi")
+        self.assertEqual(self.inbox()["text"], "no")
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
+        self.ask(ask=A2); self.say("yes"); self.result(A2, "needs ravi", "cannot")
+        self.say("do it", who="ravi")
+        self.assertNotIn("direct", self.host.launches()[-1][3])               # an agent's question: agent wording
+
+    def test_a_name_reply_answers_that_persons_open_question(self):
+        self.dm("Yogesh, is it on?"); self.clock[0] += 1; self.dm("Yogesh, " + PHOTO)
+        older, newer = sorted(self.direct_asks(), key=lambda a: a["created_at"])
+        self.dm("Dhrutiman, yes it's on", who="yogesh")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: yes it's on"))
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, "Sent to Dhrutiman."))
+        self.assertEqual(len(self.direct_asks()), 2)                          # no new message opened
+        self.assertEqual(self.state().get(newer["ask"])["status"], "answered")  # the newest of his two
+        self.assertEqual(self.state().get(older["ask"])["status"], "with_person")
+        self.dm("dhrutiman: and the other one too", who="yogesh")
+        self.assertEqual(self.state().get(older["ask"])["status"], "answered")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: and the other one too"))
+        self.dm("Dhrutiman, see you there", who="yogesh")                    # nothing from him waits: a new message
+        self.assertEqual(len(self.direct_asks()), 3)
+        new = [a for a in self.direct_asks() if a["from"] == "ysingla"]
+        self.assertEqual([(a["to"], a["status"]) for a in new], [("dhrutiman", "with_person")])
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: see you there"))
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, "Sent to Dhrutiman."))
+
+    def test_a_name_reply_answers_an_agents_question(self):
+        self.ask(); self.say("yes"); self.result(A1, "needs ravi", "cannot")
+        self.say("Asha, it is 3", who="ravi")
+        self.assertEqual(self.inbox()["text"], "it is 3")
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
+        self.assertEqual(self.direct_asks(), [])
+
+    def test_a_day_old_question_is_not_a_plain_message_candidate(self):
+        self.dm("Yogesh, " + PHOTO)
+        self.clock[0] += 25 * 3600
+        self.dm("yes", who="yogesh")
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, NOTHING_WAITING))
+        self.dm("sounds good", who="yogesh")                                  # his own task now
+        self.assertEqual(self.host.launches()[-1][1:3], ("ysingla", "t1"))
+        self.assertEqual(self.direct_asks()[0]["status"], "with_person")     # not closed
+        self.dm("Dhrutiman, sounds good", who="yogesh")                       # a name reply still answers it
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: sounds good"))
+        self.assertEqual(self.direct_asks()[0]["status"], "answered")
+        self.assertEqual(len(self.direct_asks()), 1)
 
     def test_the_colleagues_plain_reply_comes_back_as_name_colon_reply(self):
         self.dm("Yogesh, " + PHOTO)
@@ -2438,6 +2509,7 @@ class TestDirectMessages(AskBase):
         [(_, user, ref, req)] = self.host.launches()
         self.assertEqual((user, ref, req["mode"], req["ask"]), ("ysingla", "d" + ask_id[1:], "doit", ask_id))
         self.assertIn("Dhrutiman sent you the message below", req["prompt"])
+        self.assertIs(req["direct"], True)                                    # agent-chat-exec: "Dhrutiman asked you"
         self.assertNotIn("'s agent asked", req["prompt"])
         self.assertEqual(self.sent_to(DM5)[-1], (DM5, "On it."))
         self.result(ref, "Booked: Friday 4pm.", "ok", user="ysingla")

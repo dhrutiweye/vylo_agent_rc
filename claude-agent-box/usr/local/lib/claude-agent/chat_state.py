@@ -213,6 +213,9 @@ class ChatState:
         if kind == "task":
             return sum(1 for u, ts in d["task_log"] if u == user and self._day(ts) == today)
         asks = [a for a in d["asks"] if self._day(a.get("created_at", 0)) == today]
+        if kind == "direct_sent":       # a person's own name-first messages: their own cap, never the agents' limits
+            return sum(1 for a in asks if a["from"] == user and a.get("origin") == "direct")
+        asks = [a for a in asks if a.get("origin") != "direct"]
         if kind == "ask_sent":
             return sum(1 for a in asks if a["from"] == user)
         if kind == "ask_received":      # only asks the asker approved: a refused or unanswered request is not the colleague's load

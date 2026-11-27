@@ -116,6 +116,17 @@ class TestArgv(unittest.TestCase):
         self.assertNotIn("ask-colleague", preamble("doit")); self.assertNotIn("ask-colleague", preamble("ask"))
         self.assertIn("NEEDS YOU:", preamble("doit"))
 
+    def test_a_do_it_on_a_direct_message_says_the_person_asked(self):
+        def preamble(request):
+            argv = self.m.build_argv("doit", request)
+            return argv[argv.index("--append-system-prompt") + 1]
+        direct = preamble({**req("doit", ask="a0123456789", asker="dhrutiman"), "direct": True})
+        self.assertIn("dhrutiman asked you", direct)
+        self.assertNotIn("'s agent", direct)
+        agent = preamble(req("doit", ask="a0123456789", asker="srejan"))
+        self.assertIn("srejan's agent asked it", agent)
+        self.assertNotIn("srejan asked you", agent)
+
     def test_bad_requests_are_refused(self):
         for bad in ({**req(), "session_uuid": "not-a-uuid"}, {**req(), "mode": "shell"}):
             with self.assertRaises(ValueError):

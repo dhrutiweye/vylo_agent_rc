@@ -58,8 +58,12 @@ class TestChatState(Base):
                             from_name="asha", to_name="ravi")
         self.assertEqual((a["status"], a["origin"], a["from_name"], a["to_name"], a["approval_thread"]),
                          ("with_person", "direct", "asha", "ravi", None))
-        self.assertEqual(self.st.count_today("ask_received", "ravi"), 1)        # it is the colleague's load at once
-        self.assertEqual(self.st.count_today("ask_sent", "asha"), 1)
+        self.assertEqual(self.st.count_today("direct_sent", "asha"), 1)         # its own daily count
+        self.assertEqual(self.st.count_today("ask_sent", "asha"), 0)           # never the agents' ask limits
+        self.assertEqual(self.st.count_today("ask_received", "ravi"), 0)
+        self.st.new_ask("asha", "ravi", "q", "a00000000fd", status="with_person")
+        self.assertEqual((self.st.count_today("ask_sent", "asha"), self.st.count_today("ask_received", "ravi"),
+                          self.st.count_today("direct_sent", "asha")), (1, 1, 1))
         self.assertEqual(self.st.new_ask("asha", "ravi", "q", "a00000000fe")["status"], "awaiting_ok")
 
     def test_running_counts_run_status(self):
