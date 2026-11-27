@@ -205,6 +205,17 @@ class TestChatState(Base):
         self.st.close("a0123456789")
         self.assertIsNone(self.st.item_by_thread("ravi", "R9"))            # closed asks own no threads
 
+    def test_handled_message_names_are_kept_so_a_redelivery_acts_once(self):
+        self.assertTrue(self.st.mark_seen("spaces/D/messages/M1"))
+        fresh = cs.ChatState(self.path, lambda: self.now[0])                 # after a bridge restart
+        self.assertFalse(fresh.mark_seen("spaces/D/messages/M1"))
+        for i in range(600):
+            self.st.mark_seen("spaces/D/messages/X%d" % i)
+        with open(self.path) as f:
+            seen = json.load(f)["seen"]
+        self.assertEqual(len(seen), 500)
+        self.assertTrue(self.st.mark_seen("spaces/D/messages/M1"))           # long gone: a new message by now
+
     def test_json_that_is_not_an_object_reads_like_a_corrupt_file(self):
         # M10: a list (or a number) on disk must not break every lookup
         for junk in ("[]", "[1, 2]", "7", "null", '"x"'):

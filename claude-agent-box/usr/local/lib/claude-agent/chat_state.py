@@ -15,7 +15,8 @@ import json
 import os
 
 TASKS_KEPT_PER_USER = 20
-THREADS_KEPT = 20                          # more threads of one item: bot posts about it and messages routed to it
+THREADS_KEPT = 20                          # more threads of one item: the bot's posts about it
+SEEN_KEPT = 500                            # Chat message names already handled, so a redelivery acts once
 ASK_KEPT_SECONDS = 7 * 86400
 TASK_LOG_KEPT_SECONDS = 3 * 86400          # per-task creation stamps for the daily limit, outliving the 20-task trim
 NOT_APPROVED = ("awaiting_ok", "declined", "expired")
@@ -49,7 +50,7 @@ class ChatState:
 
     # ---- storage
     def _empty(self):
-        return {"next_ref": 1, "tasks": [], "asks": [], "task_log": []}
+        return {"next_ref": 1, "tasks": [], "asks": [], "task_log": [], "seen": []}
 
     def _read(self):
         try:
@@ -119,8 +120,8 @@ class ChatState:
 
     def add_thread(self, key, role, thread):
         """Another thread that belongs to task or ask `key`. The bot posts everything at the top level, and a plain
-        post starts its own thread, so each post about an item (and each plain message routed to it) is a thread of
-        its own: a reply inside any of them, or a Pub/Sub redelivery of that message, finds the item again. role is
+        post starts its own thread, so each post about an item is a thread of its own: a reply inside any of them
+        finds the item again. role is
         "task", or for an ask "approval" (the asker's side), "received" or "copy" (the colleague's)."""
         if not thread:
             return
@@ -132,6 +133,17 @@ class ChatState:
             kept = [t for t in item.get("threads") or [] if t[1] != thread]
             item["threads"] = (kept + [[role, thread]])[-THREADS_KEPT:]
         self._modify(fn)
+
+    def mark_seen(self, msg_id):
+        """True the first time a Chat message name is seen, False on a redelivery (also one after a bridge restart).
+        Only the names are kept (the last SEEN_KEPT), never any text."""
+        def fn(d):
+            seen = d["seen"] if isinstance(d.get("seen"), list) else []
+            if msg_id in seen:
+                return False
+            d["seen"] = (seen + [msg_id])[-SEEN_KEPT:]
+            return True
+        return self._modify(fn)
 
     # ---- asks
     def new_ask(self, from_user, to_user, text, ask_id):

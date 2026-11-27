@@ -1111,7 +1111,6 @@ class TestChatTasks(Base):
         self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
         t = self.state().get("t1")
         self.assertEqual((t["user"], t["thread"], t["session_uuid"], t["run_status"]), ("asha", T1, req["session_uuid"], "running"))
-        self.assertEqual(t["threads"], [["task", "spaces/DM1/threads/U1"]])     # the message's own thread is kept too
         rows = [r for r in self.audit_rows() if r["event"] == "chat_task"]
         self.assertEqual([(r["task"], r["chars"], r["phase"]) for r in rows], [("t1", 17, "started")])
 
@@ -2281,6 +2280,31 @@ class TestPlainChat(AskBase):
         self.b.handle_event(task); self.bridge().handle_event(task)
         self.assertEqual(len(self.state().tasks("asha")), 1)
         self.assertEqual(len([c for c in self.host.launches() if c[1] == "asha"]), 1)
+        self.result("t1", "Nothing odd.", "ok", user="asha")
+        more = classic("and yesterday's?", thread=DM1 + "/threads/P5", name=DM1 + "/messages/M2")
+        self.b.handle_event(more)                                             # continues t1
+        self.result("t1", "Same.", "ok", user="asha")
+        self.bridge().handle_event(more)                                      # its run finished: still not run again
+        self.assertEqual(len([c for c in self.host.launches() if c[1] == "asha"]), 2)
+
+    def test_a_redelivered_pick_acts_once_after_a_restart(self):
+        self.chat_task(who="ravi"); self.handed(); self.handed(ask=A2)
+        self.say("It is 3", who="ravi")
+        pick = classic("1", email="ravi@co.test", space=DM2, thread=DM2 + "/threads/P1", name=DM2 + "/messages/K1")
+        self.b.handle_event(pick)
+        self.assertEqual(self.inbox()["text"], "It is 3")
+        n, launches = len(self.chat.sent), len(self.host.launches())
+        self.bridge().handle_event(pick)                                      # the list is gone; "1" is not re-read
+        self.assertIsNone(self.inbox(A2))
+        self.assertEqual((len(self.chat.sent), len(self.host.launches())), (n, launches))
+
+    def test_an_approval_not_yet_shown_is_not_answered_by_a_plain_yes(self):
+        self.state().new_ask("asha", "ravi", Q, A1)                         # the row exists, its post not yet out
+        self.state().update(A1, from_name="asha", to_name="ravi")
+        self.say("yes")
+        self.assertEqual(self.chat.sent[-1], (DM1, NOTHING_WAITING))
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.assertEqual(self.host.launches(), [])
 
     def test_a_clarified_message_is_still_checked_and_never_logged(self):
         records = self.capture()
