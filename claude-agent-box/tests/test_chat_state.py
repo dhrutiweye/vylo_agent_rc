@@ -53,6 +53,15 @@ class TestChatState(Base):
         self.assertEqual(fresh.update("t1", status="done")["status"], "done")
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
+    def test_a_direct_message_is_born_with_the_colleague(self):
+        a = self.st.new_ask("asha", "ravi", "lunch at 1?", "a00000000ff", status="with_person", origin="direct",
+                            from_name="asha", to_name="ravi")
+        self.assertEqual((a["status"], a["origin"], a["from_name"], a["to_name"], a["approval_thread"]),
+                         ("with_person", "direct", "asha", "ravi", None))
+        self.assertEqual(self.st.count_today("ask_received", "ravi"), 1)        # it is the colleague's load at once
+        self.assertEqual(self.st.count_today("ask_sent", "asha"), 1)
+        self.assertEqual(self.st.new_ask("asha", "ravi", "q", "a00000000fe")["status"], "awaiting_ok")
+
     def test_running_counts_run_status(self):
         self.st.new_task("asha", "T1", "u1"); self.st.new_task("ravi", "T2", "u2")
         self.st.new_ask("asha", "ravi", "q", "aaaaaaaaaaa")

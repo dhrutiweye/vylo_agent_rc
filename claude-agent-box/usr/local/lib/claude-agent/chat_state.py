@@ -146,10 +146,13 @@ class ChatState:
         return self._modify(fn)
 
     # ---- asks
-    def new_ask(self, from_user, to_user, text, ask_id):
+    def new_ask(self, from_user, to_user, text, ask_id, status="awaiting_ok", **fields):
+        """A new ask. An agent's question starts awaiting_ok (its person's yes); a person's own name-first message
+        starts with_person, origin "direct" (their typing it is the yes). fields: more to set in the same write."""
         def fn(d):
-            a = {"ask": ask_id, "from": from_user, "to": to_user, "text": text, "status": "awaiting_ok",
+            a = {"ask": ask_id, "from": from_user, "to": to_user, "text": text, "status": status,
                  "run_status": "idle", "approval_thread": None, "received_thread": None, "created_at": self.now()}
+            a.update(fields)
             d["asks"].append(a)
             return dict(a)
         return self._modify(fn)

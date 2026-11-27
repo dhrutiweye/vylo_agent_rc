@@ -21,6 +21,12 @@ no), a colleague's question (the answer, or "do it"), the restart question (yes 
 hours (its next turn); "new: TEXT" is always a new task. When more than one thing fits, the bot asks back with a
 numbered list.
 
+Name-first messages: "Yogesh, is the photo session still on Friday?" (a colleague's people or Linux name, then a comma
+or colon) goes straight to Yogesh's DM as "Dhrutiman: ..." -- no task, no agent run, no yes/no: the person typed it,
+which is its own OK. It is kept as an ask with origin "direct", born with_person, under the same secret check and daily
+limits; Yogesh answers it like any colleague question (a reply, the ask-back list, or "do it"), and the answer is
+posted to the sender's DM as "Yogesh: ..." (never their agent's inbox: no agent is waiting).
+
 Tasks from Chat: the bridge never runs Claude: it posts "On it.", writes the request to
 ~/.claude/chat-requests/<ref>.json and starts agent-chat-exec as that person in a capped systemd unit
 (Host.launch_run). The run's result comes back through the outbox (kind "result", its ref) and is posted as it is; the
@@ -29,7 +35,8 @@ finds its task after a bridge restart.
 
 Asking a colleague: an agent's ask-colleague leaves {"kind": "ask", "to": NAME, ...} in its outbox. The bridge checks
 NAME against people.json (not yourself, known, active), the daily limits and the secret check, then asks the asker's
-person for a yes. A yes starts a read-only answer run in the colleague's account (ref = the ask id); "answer" goes
+person for a yes ('To Ravi: "..." -- send? yes / no'); the colleague then reads "Asha's agent asks: ...", so a
+person's own message and one their agent sent never look alike. A yes starts a read-only answer run in the colleague's account (ref = the ask id); "answer" goes
 back at once, anything else hands the question to the colleague, who answers or says "do it" (a normal run, ref "d" +
 id[1:]). The answer is written to the asker's ~/.claude/inbox/<ask>.json, where the waiting ask-colleague picks it up
 (an ask from a Chat task is posted to the asker instead); check_asks DMs it to the asker if nobody read it within
@@ -95,6 +102,7 @@ HELP = ('hi — sign in / set up your agent\nstatus — is it running, last acti
         'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
         'anything else — answers what is waiting for you, else goes to your agent (your last task, for 2 hours)\n'
         'new: TEXT — always a new task for your agent\n'
+        'NAME, TEXT — sends TEXT straight to that colleague; their reply comes back here\n'
         '(Or chat with the agent itself in the Claude app. Ask it to set up reminders and jobs.)')
 HELP_MULTI = ('hi — sign in / set up your agent\nstatus — is it running, last activity\n'
               'sessions — your recent conversations, and which are active\n'
@@ -102,6 +110,7 @@ HELP_MULTI = ('hi — sign in / set up your agent\nstatus — is it running, las
               'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
               'anything else — answers what is waiting for you, else goes to your agent (your last task, for 2 hours)\n'
               'new: TEXT — always a new task for your agent\n'
+              'NAME, TEXT — sends TEXT straight to that colleague; their reply comes back here\n'
               '(Your agent runs several sessions: start, open and close them in the Claude app. Ask it to set up '
               'reminders and jobs.)')
 ACTIVE_SECONDS = 600          # "sessions": a conversation with an audit row this recent is shown as active
@@ -123,12 +132,19 @@ CLARIFY_SECONDS = 600         # how long "Which one is this for?" waits for its 
 CLARIFY_CHARS = 80            # a question or task as that list shows it
 TASK_LABELS_KEPT = 500        # first words of recent tasks, in memory only (state.json never holds task text)
 INBOX_CHARS = 2000            # an answer in the asker's inbox: JSON-escaped non-ASCII must stay under read_inbox's 16 KB
-ASK_OK = 'Ask %s "%s" \u2014 yes / no'
+ASK_OK = 'To %s: "%s" \u2014 send? yes / no'           # an agent's question waits for its person's yes
 ASK_OK_CHARS = 200
 ASK_SENT = "Sent to %s."
 ASK_NOT_SENT = "Not sent."
 ASK_EXPIRED = "Your question to %s expired (no yes within %s)."
-ASK_TO_PERSON = '%s asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
+ASK_TO_PERSON = '%s\'s agent asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
+ASKS_LIMIT = "You've asked %d questions today, the daily limit."
+ASKS_RECEIVED_LIMIT = "%s has had %d questions today, the daily limit."
+# A person's own name-first message ("Yogesh, is it still on Friday?"): straight to the colleague, no yes/no (the
+# person typing it is the yes), no agent run. Kept as an ask with origin "direct", born with_person.
+DIRECT_POST = "%s: %s"                      # to the colleague, at the top level: "Dhrutiman: ..."
+DIRECT_NOT_SET_UP = "%s isn't set up on the bot yet."
+DIRECT_UNREACHABLE = "I couldn't reach %s in Chat just now, so it was not sent."
 ASK_COPY = 'Your agent answered %s ("%s"): %s Reply to correct it.'
 ASK_ANSWER = "%s: %s"                       # to the asker: "Ravi: ..." or "Ravi's agent: ..."
 ASK_CORRECTION_POST = "%s (correction): %s"
@@ -145,6 +161,9 @@ TASK_REF_RE = re.compile(r"^t[0-9]{1,15}$")
 DOIT_PROMPT = ("%s's agent asked you the question below, and %s told you to act on it (\"do it\").\n"
                "<<<QUESTION\n%s\nQUESTION>>>\n"
                "Do what it asks if it is reasonable and safe, then end with the answer to send back to %s's agent.")
+DOIT_PROMPT_DIRECT = ("%s sent you the message below, and %s told you to act on it (\"do it\").\n"
+                      "<<<QUESTION\n%s\nQUESTION>>>\n"
+                      "Do what it asks if it is reasonable and safe, then end with the answer to send back to %s.")
 
 
 def defuse_markers(text):
@@ -521,6 +540,8 @@ class Bridge:
         user, body = person["linux_user"], (text or "").strip()
         if not body:
             return
+        if self._on_direct(person, space, body):           # "Yogesh, ...": the person's own message to Yogesh
+            return
         low = body.lower()
         if low.startswith(NEW_PREFIX):
             rest = body[len(NEW_PREFIX):].strip()
@@ -541,6 +562,75 @@ class Bridge:
                 self.on_task(person, space, body)
         elif yes_no or self._usable_text(user, space, body) is not None:   # checked before it is held
             self._ask_back(person, space, body, found, yes_no)
+
+    def _direct_target(self, person, body):
+        """(colleague, text) when the message starts with a colleague's name and a comma or colon ("Yogesh, ...",
+        "yogesh: ...", "@Yogesh, ..."; the people name or the Linux name, any case, the whole name), else None. The
+        sender's own name, a name nobody has, or a name two people answer to is not a match: normal handling."""
+        hits = {}
+        for p in self.store.all():
+            for n in {str(p.get("name") or ""), str(p.get("linux_user") or "")}:
+                m = re.match(r"\s*@?%s\s*[,:]\s*(.*)\Z" % re.escape(n), body, re.I | re.S) if n else None
+                if m:
+                    hits[p.get("linux_user")] = (p, m.group(1).strip())
+        if len(hits) != 1:
+            return None
+        target, text = next(iter(hits.values()))
+        if target.get("linux_user") == person["linux_user"]:
+            return None
+        return target, text
+
+    def _new_ask_id(self):
+        while True:                                        # "a" + 10 hex, like ask-colleague's; never one in use
+            ask_id = "a" + uuid.uuid4().hex[:10]
+            if self.state.get(ask_id) is None:
+                return ask_id
+
+    def _on_direct(self, person, space, body):
+        """True when the message was a name-first message to a colleague and was handled (sent, or refused in one
+        sentence with nothing sent). It is the person's own message, so it needs no yes and runs no agent: it is kept
+        as an ask (origin "direct") handed to the colleague at once, who answers it like any question."""
+        found = self._direct_target(person, body)
+        if found is None:
+            return False
+        target, text = found
+        user, name = person["linux_user"], shown(target["name"])
+        if target.get("status") != "active" or not target.get("chat_space"):
+            self.chat.send(space, DIRECT_NOT_SET_UP % name)
+            return True
+        if not text:                                       # "Yogesh," and nothing else: ignored like a blank message
+            return True
+        if len(text) > TASK_MAX_CHARS:
+            self.chat.send(space, TOO_LONG)
+            return True
+        if looks_secret(text):
+            log.info("refused a message from %s: it looks like a secret (where=direct)", user)
+            self._audit(user, "secret_blocked", where="direct")
+            self.chat.send(space, SECRET_REFUSED)
+            return True
+        with self.run_lock:
+            refusal = None
+            if self.state.count_today("ask_sent", user) >= self.cfg.asks_per_day:
+                refusal = ASKS_LIMIT % self.cfg.asks_per_day
+            elif self.state.count_today("ask_received", target["linux_user"]) >= self.cfg.asks_received_per_day:
+                refusal = ASKS_RECEIVED_LIMIT % (name, self.cfg.asks_received_per_day)
+            if refusal is None:
+                ask_id = self._new_ask_id()
+                self.state.new_ask(user, target["linux_user"], text, ask_id, status="with_person", origin="direct",
+                                   from_name=person["name"], to_name=target["name"])
+                try:
+                    thread = self.chat.send(target["chat_space"], DIRECT_POST % (shown(person["name"]), text))
+                except Exception as e:                     # noqa: BLE001 - closed: never handed over later
+                    log.warning("could not send direct message %s from %s to %s: %s", ask_id, user,
+                                target["linux_user"], e.__class__.__name__)
+                    self.state.close(ask_id)
+                    refusal = DIRECT_UNREACHABLE % name
+                else:
+                    ask = self.state.update(ask_id, received_thread=thread, handed_at=self.now())
+                    self._audit_ask(ask, "direct_sent", len(text))
+                    log.info("direct message %s from %s to %s sent", ask_id, user, target["linux_user"])
+        self.chat.send(space, refusal or ASK_SENT % name)
+        return True
 
     def _candidates(self, person, body, yes_no):
         """[(kind, key, names)] of what this message could be for, narrowed by the brief's rules. kind is approval
@@ -1337,10 +1427,9 @@ class Bridge:
         if target.get("status") != "active" or not target.get("chat_space"):
             return refuse("refused", "%s hasn't set up their agent yet." % shown(name))
         if self.state.count_today("ask_sent", user) >= self.cfg.asks_per_day:
-            return refuse("limit", "You've asked %d questions today, the daily limit." % self.cfg.asks_per_day)
+            return refuse("limit", ASKS_LIMIT % self.cfg.asks_per_day)
         if self.state.count_today("ask_received", target["linux_user"]) >= self.cfg.asks_received_per_day:
-            return refuse("limit", "%s has had %d questions today, the daily limit."
-                          % (shown(name), self.cfg.asks_received_per_day))
+            return refuse("limit", ASKS_RECEIVED_LIMIT % (shown(name), self.cfg.asks_received_per_day))
         if looks_secret(text):
             log.info("refused ask %s from %s: it looks like a secret (where=ask)", ask_id, user)
             self._audit(user, "secret_blocked", where="ask")
@@ -1408,8 +1497,9 @@ class Bridge:
                 if ask.get("run_status") in RUN_BUSY:
                     self._reply(space, "Your agent is already on it.")
                     return
+                prompt = DOIT_PROMPT_DIRECT if ask.get("origin") == "direct" else DOIT_PROMPT
                 request = {"mode": "doit", "session_uuid": str(uuid.uuid4()), "resume": False, "ask": ask_id,
-                           "asker": ask["from_name"], "prompt": DOIT_PROMPT % (
+                           "asker": ask["from_name"], "prompt": prompt % (
                                shown(ask["from_name"]), shown(ask["to_name"]), defuse_markers(ask["text"]),
                                shown(ask["from_name"]))}
                 started = self._start_ask_run(ask_id, "d" + ask_id[1:], request)
@@ -1497,9 +1587,9 @@ class Bridge:
         if not colleague or not colleague.get("chat_space"):
             log.warning("ask %s: %s cannot be reached in Chat", ask_id, ask["to"])
             return
+        wording = DIRECT_POST if ask.get("origin") == "direct" else ASK_TO_PERSON
         try:
-            thread = self.chat.send(colleague["chat_space"], ASK_TO_PERSON % (shown(ask["from_name"]), ask["text"])
-                                    + note)
+            thread = self.chat.send(colleague["chat_space"], wording % (shown(ask["from_name"]), ask["text"]) + note)
         except Exception as e:                             # noqa: BLE001
             log.warning("could not hand ask %s to %s: %s", ask_id, ask["to"], e.__class__.__name__)
             return
@@ -1520,6 +1610,22 @@ class Bridge:
                   "correction": bool(correction)}
         if self.state.get(ask_id).get("run_status") == "queued":   # a waiting run for a decided question never starts
             fields.update(run_status="idle", run_ref=None, request=None)
+        if ask.get("origin") == "direct":                  # no agent waits: the sender's DM, never the inbox
+            p = self._person_of(ask["from"])
+            posted = False
+            if p and p.get("chat_space"):
+                try:
+                    self._reply(p["chat_space"], self._answer_post(ask, answer, by))
+                    posted = True
+                except Exception as e:                     # noqa: BLE001 - check_asks posts it (_settle)
+                    log.warning("could not post the answer to direct message %s for %s: %s", ask_id, ask["from"],
+                                e.__class__.__name__)
+            if posted:
+                fields.update(delivered_via="dm", answer=None)
+            ask = self.state.update(ask_id, **fields)
+            if posted:
+                self._audit_ask(ask, "delivered", len(answer), via="dm")
+            return                                         # check_asks closes it later, as any other
         if ask.get("reply_task"):                          # from a Chat task: posted to the asker, no inbox
             via = self._post_to_task(ask, outcome, answer, by, correction)
             if via:
@@ -1543,19 +1649,23 @@ class Bridge:
         """End of delivery: an answer nobody picked up goes to the asker's DM; any unread file is removed; the ask is
         closed (text and answer dropped). False when the DM could not be posted (tried again next time)."""
         ask_id, user = ask["ask"], ask["from"]
+        direct = ask.get("origin") == "direct"             # never has an inbox file: unread = not yet posted
         if ask.get("delivered_via"):                       # already posted to the asker
             unread = False
+        elif direct:
+            unread = True
         if unread is None:
             try:
                 unread = bool(ask.get("inbox_removed")) or not self.host.inbox_taken(user, ask_id)
             except Exception:                              # noqa: BLE001 - cannot tell: the DM is the safe side
                 unread = True
-        if unread:
+        if unread and not direct:
             try:
                 self.host.remove_inbox(user, ask_id)
                 self.state.update(ask_id, inbox_removed=True)
             except Exception as e:                         # noqa: BLE001
                 log.warning("could not remove the unread answer to ask %s for %s: %s", ask_id, user, e.__class__.__name__)
+        if unread:
             if ask.get("outcome") == "answered":
                 p = self._person_of(user)
                 answer = ask.get("answer") or ""

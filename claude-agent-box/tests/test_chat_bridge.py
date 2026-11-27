@@ -1442,8 +1442,8 @@ class TestChatTasks(Base):
 A1, A2, A3 = "a0000000001", "a0000000002", "a0000000003"
 D1 = "d0000000001"
 Q = "what is the retry limit on the upload endpoint?"
-ASK_OK = 'Ask %s "%s" \u2014 yes / no'
-ASK_TO_PERSON = '%s asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
+ASK_OK = 'To %s: "%s" \u2014 send? yes / no'
+ASK_TO_PERSON = '%s\'s agent asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
 ASK_COPY = 'Your agent answered %s ("%s"): %s Reply to correct it.'   # the answer brings its own full stop
 ASK_DM = "%s: %s"
 DM1, DM2, DM3 = "spaces/DM1", "spaces/DM2", "spaces/DM3"
@@ -1903,7 +1903,7 @@ class TestAsks(AskBase):
         self.ask(ask=A1); self.ask(ask=A2); self.ask(ask=A3)
         self.assertEqual(self.inbox(A3)["outcome"], "limit")
         self.assertIsNone(self.state().get(A3))
-        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("Ask Ravi ")]), 2)
+        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("To Ravi: ")]), 2)
         self.cfg.asks_per_day = 10; self.cfg.asks_received_per_day = 1
         self.approve(A1)                                                      # Ravi has had one today
         self.add_person("mira", "mira", DM3)
@@ -2045,7 +2045,7 @@ class TestPlainChat(AskBase):
 
     def test_a_top_level_yes_approves_the_one_waiting_approval_and_no_declines(self):
         self.ask()
-        self.assertEqual(self.chat.sent, [(DM1, 'Ask Ravi "%s" — yes / no' % Q)])
+        self.assertEqual(self.chat.sent, [(DM1, 'To Ravi: "%s" — send? yes / no' % Q)])
         self.say("yes")                                                       # the screenshot bug: no thread needed
         self.assertEqual([(c[1], c[2]) for c in self.host.launches()], [("ravi", A1)])
         self.assertEqual(self.state().get(A1)["status"], "asking_agent")
@@ -2322,6 +2322,221 @@ class TestPlainChat(AskBase):
                 self.assertNotIn(t, self.file_text(os.path.join(self.audit, u + ".jsonl")))
         for t in (GH_TOKEN, "look into the upload limit"):                    # an answer is held only until it closes
             self.assertNotIn(t, self.file_text(self.state_file))
+
+
+DM4, DM5, DM6 = "spaces/DM4", "spaces/DM5", "spaces/DM6"
+PHOTO = "is the photo session still on Friday?"
+
+
+class TestDirectMessages(AskBase):
+    """Name-first messages: "Yogesh, ..." typed by a person goes straight to Yogesh as their own message (no task, no
+    agent run, no yes/no); Yogesh's answer comes back as "Yogesh: ...". Yogesh's display name is "yogesh", his Linux
+    name "ysingla", so both are shown to match and the display name is what people read."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_person("dhrutiman", "dhrutiman", DM4)
+        self.add_person("yogesh", "ysingla", DM5)
+
+    def dm(self, text, who="dhrutiman", name=None):
+        space = {"dhrutiman": DM4, "yogesh": DM5, "kiran": DM6, "asha": DM1, "ravi": DM2}[who]
+        self.b.handle_event(classic(text, email=who + "@co.test", space=space, name=name))
+
+    def direct_asks(self):
+        return [a for a in self.state().asks() if a.get("origin") == "direct"]
+
+    def test_a_name_first_message_goes_straight_to_the_colleague(self):
+        self.dm("Yogesh, " + PHOTO)
+        self.assertEqual(self.state().tasks("dhrutiman"), [])
+        self.assertEqual(self.host.launches(), [])
+        self.assertEqual(self.sent_to(DM5), [(DM5, "Dhrutiman: " + PHOTO)])
+        self.assertEqual(self.sent_to(DM4), [(DM4, "Sent to Yogesh.")])        # no approval: their own message
+        [a] = self.direct_asks()
+        self.assertEqual((a["from"], a["to"], a["status"], a["text"], a["from_name"], a["to_name"]),
+                         ("dhrutiman", "ysingla", "with_person", PHOTO, "dhrutiman", "yogesh"))
+        self.assertEqual(a["received_thread"], DM5 + "/threads/T%d" % (self.chat.threads - 1))
+        self.assertIsNotNone(a.get("handed_at"))
+        self.assertRegex(a["ask"], r"^a[0-9a-f]{10}$")
+        for u in ("dhrutiman", "ysingla"):
+            [row] = self.ask_rows(u)
+            self.assertEqual((row["phase"], row["from"], row["to"], row["chars"], row["ask"]),
+                             ("direct_sent", "dhrutiman", "yogesh", len(PHOTO), a["ask"]))
+            self.assertNotIn("photo", self.file_text(os.path.join(self.audit, u + ".jsonl")))
+        self.assertEqual(self.host.inbox_writes, [])
+
+    def test_the_forms_that_match_and_those_that_do_not(self):
+        for i, text in enumerate(("yogesh: is it on?", "@Yogesh, is it on?", "ysingla, is it on?",
+                                  "  YOGESH :  is it on?", "Yogesh,is it on?\nsecond line")):
+            with self.subTest(text=text):
+                self.dm(text)
+                self.assertEqual(len(self.direct_asks()), i + 1)
+                expected = text.split(",", 1)[-1] if "," in text else text.split(":", 1)[-1]
+                self.assertEqual(self.sent_to(DM5)[-1], (DM5, "Dhrutiman: " + expected.strip()))
+        self.assertEqual(self.host.launches(), [])
+        n = len(self.sent_to(DM5))
+        for text in ("Check Yogesh's PR", "yogeshwar, is it on?", "Dhrutiman, note to self", "dhrutiman: me",
+                     "Priya, are you in?", "Hey Yogesh, is it on?"):
+            with self.subTest(text=text):
+                self.dm(text)
+                self.assertEqual(len(self.direct_asks()), 5)
+                self.assertEqual(len(self.sent_to(DM5)), n)
+        self.assertEqual(self.host.launches()[0][1:3], ("dhrutiman", "t1"))   # normal handling: a task
+        self.assertEqual(self.host.launches()[0][3]["prompt"], "Check Yogesh's PR")
+
+    def test_refusals_send_nothing(self):
+        self.add_person("kiran", "kiran", None, status="pending")
+        self.dm("Kiran, are you in today?")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Kiran isn't set up on the bot yet."))
+        n = len(self.chat.sent)
+        self.dm("Yogesh,")                                                    # blank: ignored like a blank message
+        self.dm("Yogesh:   ")
+        self.assertEqual(len(self.chat.sent), n)
+        self.dm("Yogesh, " + "x" * 4001)
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "That's too long for one message (4000 characters max)."))
+        self.dm("Yogesh, here it is: " + GH_TOKEN)
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "That looks like a secret, so I did not send it."))
+        rows = [r for r in cb.read_tail(os.path.join(self.audit, "dhrutiman.jsonl")) if r["event"] == "secret_blocked"]
+        self.assertEqual([r["where"] for r in rows], ["direct"])
+        self.assertEqual(self.sent_to(DM5), []); self.assertEqual(self.direct_asks(), [])
+        self.assertEqual(self.host.launches(), []); self.assertEqual(self.state().tasks("dhrutiman"), [])
+        self.assertNotIn(GH_TOKEN, self.file_text(os.path.join(self.audit, "dhrutiman.jsonl")))
+        self.assertNotIn(GH_TOKEN, self.file_text(self.state_file))
+
+    def test_the_daily_limits_apply(self):
+        self.cfg.asks_per_day = 2
+        self.dm("Yogesh, one?"); self.dm("Yogesh, two?"); self.dm("Yogesh, three?")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "You've asked 2 questions today, the daily limit."))
+        self.assertEqual(len(self.sent_to(DM5)), 2)
+        self.cfg.asks_per_day = 10; self.cfg.asks_received_per_day = 2
+        self.dm("Yogesh, four?", who="asha")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Yogesh has had 2 questions today, the daily limit."))
+        self.assertEqual(len(self.sent_to(DM5)), 2); self.assertEqual(len(self.direct_asks()), 2)
+
+    def test_the_colleagues_plain_reply_comes_back_as_name_colon_reply(self):
+        self.dm("Yogesh, " + PHOTO)
+        self.dm("Yes, 4pm in the studio", who="yogesh")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: Yes, 4pm in the studio"))
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, "Sent to Dhrutiman."))
+        self.assertEqual(self.host.inbox_writes, []); self.assertEqual(self.host.launches(), [])
+        [a] = self.direct_asks()
+        self.assertEqual((a["status"], a["delivered_via"]), ("answered", "dm"))
+        rows = [r for r in self.ask_rows("dhrutiman") if r["phase"] == "delivered"]
+        self.assertEqual([(r["via"], r["chars"]) for r in rows], [("dm", len("Yes, 4pm in the studio"))])
+        self.clock[0] += 121; self.b.check_asks()
+        [a] = self.direct_asks()
+        self.assertIsNotNone(a["closed_at"]); self.assertNotIn("text", a)
+        self.assertEqual(self.host.inbox_writes, [])
+        n = len(self.sent_to(DM4))
+        self.dm("also bring the badge", who="yogesh")                         # his own message now: a task
+        self.assertEqual(len(self.sent_to(DM4)), n)
+        self.assertEqual(self.host.launches()[-1][1:3], ("ysingla", "t1"))
+
+    def test_do_it_hands_it_to_the_colleagues_agent(self):
+        self.dm("Yogesh, " + PHOTO)
+        ask_id = self.direct_asks()[0]["ask"]
+        self.dm("do it", who="yogesh")
+        [(_, user, ref, req)] = self.host.launches()
+        self.assertEqual((user, ref, req["mode"], req["ask"]), ("ysingla", "d" + ask_id[1:], "doit", ask_id))
+        self.assertIn("Dhrutiman sent you the message below", req["prompt"])
+        self.assertNotIn("'s agent asked", req["prompt"])
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, "On it."))
+        self.result(ref, "Booked: Friday 4pm.", "ok", user="ysingla")
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh's agent: Booked: Friday 4pm."))
+        self.assertEqual(self.host.inbox_writes, [])
+
+    def test_two_messages_from_two_people_ask_back_naming_both(self):
+        self.dm("Yogesh, " + PHOTO)
+        self.dm("Yogesh, lunch at 1?", who="asha")
+        self.dm("sounds good", who="yogesh")
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, 'Which one is this for?\n1. Dhrutiman\'s question: "%s"\n'
+                                                     '2. Asha\'s question: "lunch at 1?"\n3. A new task\n'
+                                                     'Reply with the number or the name.' % PHOTO))
+        self.dm("asha", who="yogesh")
+        self.assertEqual(self.chat.sent[-2], (DM1, "Yogesh: sounds good"))
+        self.assertEqual(self.sent_to(DM4), [(DM4, "Sent to Yogesh.")])
+        self.assertEqual(self.host.inbox_writes, [])
+
+    def test_agent_asks_keep_the_approval_with_the_new_wording(self):
+        self.ask()
+        self.assertEqual(self.chat.sent[-1], (DM1, 'To Ravi: "%s" — send? yes / no' % Q))
+        self.say("yes")
+        self.result(A1, "needs ravi", "cannot")
+        self.assertTrue(self.sent_to(DM2)[-1][1].startswith('Asha\'s agent asks: "%s" — just reply' % Q))
+        self.dm("Asha, see you at 3", who="dhrutiman")                        # beside it, a person's own message
+        self.assertEqual(self.chat.sent[-2], (DM1, "Dhrutiman: see you at 3"))
+        self.assertEqual(self.state().get(A1)["status"], "with_person")
+
+    def test_a_direct_message_acts_once_and_its_text_is_never_logged(self):
+        records = self.capture()
+        ev = classic("Yogesh, " + PHOTO, email="dhrutiman@co.test", space=DM4, name=DM4 + "/messages/M1")
+        self.b.handle_event(ev); self.b.handle_event(ev)
+        cb.Bridge(self.cfg, cb.PeopleStore(self.people), self.chat, self.host, now=lambda: self.clock[0]).handle_event(ev)
+        self.assertEqual(len(self.sent_to(DM5)), 1); self.assertEqual(len(self.direct_asks()), 1)
+        reply = classic("Yes, 4pm", email="yogesh@co.test", space=DM5, name=DM5 + "/messages/R1")
+        self.b.handle_event(reply)
+        cb.Bridge(self.cfg, cb.PeopleStore(self.people), self.chat, self.host, now=lambda: self.clock[0]).handle_event(reply)
+        self.assertEqual(self.sent_to(DM4).count((DM4, "Yogesh: Yes, 4pm")), 1)
+        self.assertEqual(self.state().tasks("ysingla"), [])
+        logged = " ".join(r.getMessage() for r in records)
+        for t in ("photo", "Yes, 4pm"):
+            self.assertNotIn(t, logged)
+            for u in ("dhrutiman", "ysingla"):
+                self.assertNotIn(t, self.file_text(os.path.join(self.audit, u + ".jsonl")))
+
+    def test_a_closed_direct_message_ignores_input_in_its_thread(self):
+        self.dm("Yogesh, " + PHOTO)
+        thread = self.direct_asks()[0]["received_thread"]
+        self.b.handle_event(classic("Yes, 4pm", email="yogesh@co.test", space=DM5, thread=thread))
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "Yogesh: Yes, 4pm"))
+        self.clock[0] += 121; self.b.check_asks()
+        n = len(self.chat.sent)
+        self.b.handle_event(classic("one more thing", email="yogesh@co.test", space=DM5, thread=thread))
+        self.assertEqual(self.chat.sent[n:], [(DM5, "That question is closed.")])
+        self.assertEqual(self.host.launches(), [])
+
+    def test_a_name_two_people_answer_to_is_not_a_match(self):
+        self.add_person("ysingla", "kumar", DM6)                              # another person's people name
+        self.dm("ysingla, is it on?")
+        self.assertEqual(self.direct_asks(), [])
+        self.assertEqual((self.sent_to(DM5), self.sent_to(DM6)), ([], []))
+        self.assertEqual(self.host.launches()[-1][1:3], ("dhrutiman", "t1"))   # normal handling: a task
+
+    def test_a_direct_message_handed_over_late_keeps_the_persons_wording(self):
+        self.state().new_ask("dhrutiman", "ysingla", PHOTO, "a00000000aa", status="with_person", origin="direct",
+                             from_name="dhrutiman", to_name="yogesh")         # a crash before its post went out
+        self.b.check_asks()
+        self.assertEqual(self.sent_to(DM5), [(DM5, "Dhrutiman: " + PHOTO)])
+        self.assertIsNotNone(self.state().get("a00000000aa")["handed_at"])
+
+    def test_failed_posts_send_nothing_twice_and_reach_the_sender_later(self):
+        real = self.chat.send
+        def down(space, text, thread=None, new_thread=False):
+            if space == DM5:
+                raise RuntimeError("chat down")
+            return real(space, text, thread=thread, new_thread=new_thread)
+        self.chat.send = down
+        self.dm("Yogesh, " + PHOTO)
+        self.assertEqual(self.sent_to(DM4)[-1], (DM4, "I couldn't reach Yogesh in Chat just now, so it was not sent."))
+        [a] = self.direct_asks()
+        self.assertIsNotNone(a["closed_at"])
+        self.chat.send = real
+        self.clock[0] += 3600; self.b.check_asks()                            # never handed over later
+        self.assertEqual(self.sent_to(DM5), [])
+        self.dm("Yogesh, " + PHOTO)                                            # the answer's post fails once
+        def down4(space, text, thread=None, new_thread=False):
+            if space == DM4 and text.startswith("Yogesh: "):
+                raise RuntimeError("chat down")
+            return real(space, text, thread=thread, new_thread=new_thread)
+        self.chat.send = down4
+        self.dm("Yes, 4pm", who="yogesh")
+        self.assertEqual(self.sent_to(DM5)[-1], (DM5, "Sent to Dhrutiman."))
+        self.chat.send = real
+        self.clock[0] += 121; self.b.check_asks()
+        self.assertEqual(self.sent_to(DM4).count((DM4, "Yogesh: Yes, 4pm")), 1)
+        self.assertEqual(self.host.inbox_writes, [])
+        self.assertEqual([c for c in self.host.calls if c[0] == "remove_inbox"], [])
+        self.clock[0] += 121; self.b.check_asks()
+        self.assertEqual(self.sent_to(DM4).count((DM4, "Yogesh: Yes, 4pm")), 1)
 
 
 class TestSystemHostInbox(unittest.TestCase):
