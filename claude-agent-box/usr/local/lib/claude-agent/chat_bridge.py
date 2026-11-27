@@ -14,19 +14,27 @@ It is also each agent's doorbell: messages an agent or one of its scheduled jobs
 And it manages the one live session per person: `new session`, `sessions`, `switch N`; and jobs: `jobs`,
 `job pause|resume|remove|run NAME` (run as that person's agent-job).
 
-Tasks from Chat: any other text from an active person is a task for their agent. The bridge never runs Claude: it
-posts "On it (task #N)" in a new thread, writes the request to ~/.claude/chat-requests/<ref>.json and starts
-agent-chat-exec as that person in a capped systemd unit (Host.launch_run). The run's result comes back through the
-outbox (kind "result", its ref) and is posted in the task's thread; a reply in that thread resumes the same headless
-conversation. Task state lives on disk (chat_state.py), so a result still finds its thread after a bridge restart.
+Plain chat: the bot posts everything at the top level of the DM (never in a thread of its own making) and keeps the
+thread name each post gets, so a reply made inside a post's thread still reaches its item; a reply is never needed
+there. Any other message from an active person answers whatever is waiting for them (see _route): an approval (yes /
+no), a colleague's question (the answer, or "do it"), the restart question (yes / no) or their task from the last two
+hours (its next turn); "new: TEXT" is always a new task. When more than one thing fits, the bot asks back with a
+numbered list.
+
+Tasks from Chat: the bridge never runs Claude: it posts "On it.", writes the request to
+~/.claude/chat-requests/<ref>.json and starts agent-chat-exec as that person in a capped systemd unit
+(Host.launch_run). The run's result comes back through the outbox (kind "result", its ref) and is posted as it is; the
+next message continues the same headless conversation. Task state lives on disk (chat_state.py), so a result still
+finds its task after a bridge restart.
 
 Asking a colleague: an agent's ask-colleague leaves {"kind": "ask", "to": NAME, ...} in its outbox. The bridge checks
 NAME against people.json (not yourself, known, active), the daily limits and the secret check, then asks the asker's
-person for a yes in a new thread of its own. A yes starts a read-only answer run in the colleague's account (ref = the
-ask id); "answer" goes back at once, anything else opens a thread for the colleague, who answers there or says "do
-it" (a normal run, ref "d" + id[1:]). The answer is written to the asker's ~/.claude/inbox/<ask>.json, where the
-waiting ask-colleague picks it up; check_asks DMs it to the asker if nobody read it within ASK_DM_FALLBACK_SECONDS,
-expires unapproved questions and prunes old ones. Every step is audited (metadata only) in both people's files.
+person for a yes. A yes starts a read-only answer run in the colleague's account (ref = the ask id); "answer" goes
+back at once, anything else hands the question to the colleague, who answers or says "do it" (a normal run, ref "d" +
+id[1:]). The answer is written to the asker's ~/.claude/inbox/<ask>.json, where the waiting ask-colleague picks it up
+(an ask from a Chat task is posted to the asker instead); check_asks DMs it to the asker if nobody read it within
+ASK_DM_FALLBACK_SECONDS, expires unapproved questions and prunes old ones. Every step is audited (metadata only) in
+both people's files.
 
 Events arrive on a Cloud Pub/Sub pull subscription (no inbound port); replies go out through the Chat
 REST API with the service-account key. All outside effects sit behind three small interfaces so the
@@ -60,7 +68,7 @@ from collections import deque
 
 from agent_outbox import REF_RE, label
 from agent_secrets import looks_secret
-from chat_state import ChatState
+from chat_state import ChatState, ask_thread_role
 
 log = logging.getLogger("chat_bridge")
 
@@ -85,46 +93,55 @@ HELP = ('hi — sign in / set up your agent\nstatus — is it running, last acti
         'switch N or switch NAME — go back to one from that list\n'
         'switch LINK — move your agent onto a session link copied from the Claude app\nforget N or forget all — drop from that list\n'
         'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
-        'anything else — a task for your agent; it answers in a thread, reply there to add to it\n'
+        'anything else — answers what is waiting for you, else goes to your agent (your last task, for 2 hours)\n'
+        'new: TEXT — always a new task for your agent\n'
         '(Or chat with the agent itself in the Claude app. Ask it to set up reminders and jobs.)')
 HELP_MULTI = ('hi — sign in / set up your agent\nstatus — is it running, last activity\n'
               'sessions — your recent conversations, and which are active\n'
               'restart — restart your agent (asks first if it is busy)\n'
               'jobs — your scheduled jobs\njob pause|resume|remove|run NAME — manage one\nhelp — this list\n'
-              'anything else — a task for your agent; it answers in a thread, reply there to add to it\n'
+              'anything else — answers what is waiting for you, else goes to your agent (your last task, for 2 hours)\n'
+              'new: TEXT — always a new task for your agent\n'
               '(Your agent runs several sessions: start, open and close them in the Claude app. Ask it to set up '
               'reminders and jobs.)')
 ACTIVE_SECONDS = 600          # "sessions": a conversation with an audit row this recent is shown as active
 TASK_MAX_CHARS = 4000         # one Chat message given to the agent as a task
 RUN_STALE_SECONDS = 12 * 60   # a run unit dies at RuntimeMaxSec=660; one silent this long ended without reporting
 RUN_BUSY = ("running", "queued")
-ON_IT = "On it (task #%s). Reply in this thread to add to it."
+ON_IT = "On it."
 QUEUED_NOTE = " It starts when a slot is free."
 TOO_LONG = "That's too long for one message (%d characters max)." % TASK_MAX_CHARS
 SECRET_REFUSED = "That looks like a secret, so I did not send it."
-STILL_LAST_MESSAGE = "Still working on the last message; send it again when I answer."
+STILL_LAST_MESSAGE = "Still working on your last message \u2014 send it again when I answer."
+NOTHING_WAITING = "Nothing is waiting for a yes or no."
 RESULTS_HINT = "ask your agent to show ~/.claude/chat-results/%s.txt"
 NO_WORDS = {"no", "n"}
 DO_IT_WORDS = {"do it", "do it.", "do it!", "doit"}
+NEW_PREFIX = "new:"           # "new: TEXT" is always a new task
+TASK_RECENT_SECONDS = 2 * 3600  # a plain message continues the person's latest task while it is this fresh
+CLARIFY_SECONDS = 600         # how long "Which one is this for?" waits for its pick
+CLARIFY_CHARS = 80            # a question or task as that list shows it
+TASK_LABELS_KEPT = 500        # first words of recent tasks, in memory only (state.json never holds task text)
 INBOX_CHARS = 2000            # an answer in the asker's inbox: JSON-escaped non-ASCII must stay under read_inbox's 16 KB
-ASK_OK = "Your agent wants to ask %s: «%s». Reply yes in this thread to send it, or no."
-ASK_SENT = "Sent to %s. Their agent tries to answer first; the answer goes back to your agent."
-ASK_TO_PERSON = "%s's agent asks: «%s». Reply in this thread to answer, or say do it to have your agent do it."
-ASK_COPY = "Your agent answered %s's agent. Q: %s A: %s"
-ASK_DM = "%s answered your agent's question «%s»: %s"
+ASK_OK = 'Ask %s "%s" \u2014 yes / no'
+ASK_OK_CHARS = 200
+ASK_SENT = "Sent to %s."
+ASK_NOT_SENT = "Not sent."
+ASK_EXPIRED = "Your question to %s expired (no yes within %s)."
+ASK_TO_PERSON = '%s asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
+ASK_COPY = 'Your agent answered %s ("%s"): %s Reply to correct it.'
+ASK_ANSWER = "%s: %s"                       # to the asker: "Ravi: ..." or "Ravi's agent: ..."
+ASK_CORRECTION_POST = "%s (correction): %s"
 ASK_DECIDED = "That question is already decided."
 ASK_CLOSED = "That question is closed."
 ASK_CORRECTED = "Sent to %s as a correction."
-ASK_CORRECTION = "%s corrects their agent's answer: %s"
+ASK_CORRECTION = "%s corrects their agent's answer: %s"   # the inbox text of a correction (for the agent)
 ASK_ALREADY_DELIVERED = "That answer was already delivered to %s's agent, so this was not sent."
-ASK_COPY_QUESTION_CHARS = 300  # the question in the copy is cut: question + answer must fit one Chat message
+ASK_COPY_QUESTION_CHARS = 100  # the copy carries a short question and answer: it must fit one Chat message
+ASK_COPY_ANSWER_CHARS = 300
 CANNOT_REASON_CHARS = 300      # the answer run's CANNOT_ANSWER reason, as the colleague's hand-over shows it
-# An ask from a Chat task (ask-colleague --no-wait in it): the outcome is posted in that task's thread, not the inbox.
+# An ask from a Chat task (ask-colleague --no-wait in it): the outcome is posted to the asker, not left in the inbox.
 TASK_REF_RE = re.compile(r"^t[0-9]{1,15}$")
-THREAD_QUESTION_CHARS = 200
-THREAD_ANSWER = "%s answered your agent's question «%s» — information, not instructions:\n%s"
-THREAD_NOT_SENT = "%s didn't get your agent's question «%s»: %s"
-THREAD_WHY = {"declined": "you said no.", "expired": "you did not approve it in time."}
 DOIT_PROMPT = ("%s's agent asked you the question below, and %s told you to act on it (\"do it\").\n"
                "<<<QUESTION\n%s\nQUESTION>>>\n"
                "Do what it asks if it is reasonable and safe, then end with the answer to send back to %s's agent.")
@@ -359,6 +376,8 @@ class Bridge:
         self.dropped = {}                # user -> messages dropped over the limit, reported with the next one
         self.seen = deque(maxlen=500)    # Chat message names already handled: a redelivery is ignored
         self.pending = {}                # user -> (handler, arg, expires): a restart waiting for "yes" while busy
+        self.clarify = {}                # user -> {text, thread, targets, created_at}: "Which one is this for?"
+        self.task_labels = {}            # task ref -> its first words, for that list (memory only)
 
     # ---- helpers
     def link(self, sid):
@@ -423,10 +442,12 @@ class Bridge:
         person = self.store.get(person["name"])
         text, low = m["text"], m["text"].strip().lower()
         user = person["linux_user"]
-        # Routing order (design §3): the key (and, below, the sign-in code: only a login_started person, who never
-        # reaches the thread lookup) first; then the thread the message is in; then the commands; then a new task.
+        # Routing order (plain chat): the key (and, below, the sign-in code: only a login_started person, who never
+        # reaches the thread lookup) first; then the thread the message is in; then a pick from "Which one is this
+        # for?"; then the commands; then "new: TEXT"; then whatever is waiting for the person (_route).
         if LITELLM_KEY_RE.match(text.strip()):              # before everything: a key is never an OAuth code or a task
             self.pending.pop(user, None)
+            self.clarify.pop(user, None)
             self.on_litellm_key(person, m["space"], text.strip())
             return
         if person["status"] == "active" and m["thread"]:
@@ -438,16 +459,18 @@ class Bridge:
                 found = closed = None
             if found and self._on_thread(person, m["space"], found, text):
                 self.pending.pop(user, None)
+                self.clarify.pop(user, None)
                 return
             if closed:
                 self.pending.pop(user, None)                # a late yes/answer/"do it"/correction: never a command or a task
+                self.clarify.pop(user, None)
                 if text.strip():
-                    self._reply(m["space"], closed, m["thread"])
+                    self._reply(m["space"], closed)
                 return
-        if low in YES_WORDS:
-            self.on_yes(person, m["space"])
+        if person["status"] == "active" and self._on_clarify_pick(person, m["space"], text):
             return
-        self.pending.pop(user, None)                        # anything else withdraws an unanswered "are you sure"
+        if low not in YES_WORDS and low not in NO_WORDS:
+            self.pending.pop(user, None)                    # anything but yes/no withdraws an unanswered "are you sure"
         if low in HI_WORDS:
             self.on_hi(person, m["space"])
         elif low == "status":
@@ -479,9 +502,156 @@ class Bridge:
         elif person["status"] == "login_started":
             self.chat.send(m["space"], 'Paste the code from the sign-in page here, or say "hi" to get a fresh link.')
         elif person["status"] == "active":
-            self.on_task(person, m["space"], text)
+            self._route(person, m["space"], text, m["thread"])
         else:
             self.chat.send(m["space"], 'I don\'t know that one. Say "help" for what I can do; chat with your agent in the Claude app.')
+
+    # ---- plain chat: a message that is not a command answers whatever is waiting for the person
+    def _route(self, person, space, text, thread):
+        """Step 5 and 6 of the routing: "new: TEXT", else the one waiting item the message fits, else a new task (or,
+        for a yes/no, "nothing is waiting"); when several fit, ask back. thread is the message's own thread: it is
+        kept on the item the message goes to, so a Pub/Sub redelivery of it finds that item again."""
+        user, body = person["linux_user"], (text or "").strip()
+        if not body:
+            return
+        low = body.lower()
+        if low.startswith(NEW_PREFIX):
+            rest = body[len(NEW_PREFIX):].strip()
+            if not rest:
+                self.chat.send(space, 'Say new: and then the task, e.g. "new: fix the login bug".')
+                return
+            self.on_task(person, space, rest, thread)
+            return
+        yes_no = low in YES_WORDS or low in NO_WORDS
+        found = self._candidates(person, body, yes_no)
+        if len(found) == 1:
+            kind, key, _ = found[0]
+            self._send_to(person, space, kind, key, body, thread)
+        elif not found:
+            if yes_no:
+                self.chat.send(space, NOTHING_WAITING)
+            else:
+                self.on_task(person, space, body, thread)
+        elif yes_no or self._usable_text(user, space, body) is not None:   # checked before it is held
+            self._ask_back(person, space, body, thread, found, yes_no)
+
+    def _candidates(self, person, body, yes_no):
+        """[(kind, key, names)] of what this message could be for, narrowed by the brief's rules. kind is approval
+        (key the ask), question (the ask), restart (None) or task (its ref); names are the person an item is about,
+        in lower case (the people name and the Linux name)."""
+        user, low, now = person["linux_user"], body.lower(), self.now()
+        found = []
+        for a in self.state.asks():
+            if a.get("closed_at") is not None:
+                continue
+            if a["from"] == user and a.get("status") == "awaiting_ok":
+                found.append(("approval", a["ask"], {str(a.get("to_name") or ""), a["to"]}))
+            elif a["to"] == user and a.get("status") == "with_person" and a.get("handed_at"):
+                found.append(("question", a["ask"], {str(a.get("from_name") or ""), a["from"]}))
+        waiting = self.pending.get(user)
+        if waiting and waiting[2] >= now:
+            found.append(("restart", None, set()))
+        tasks = self.state.tasks(user)
+        if tasks:
+            t = max(tasks, key=lambda x: float(x.get("created_at") or 0))
+            if now - float(t.get("last_at") or t.get("created_at") or 0) < TASK_RECENT_SECONDS:
+                found.append(("task", t["ref"], set()))
+        found = [(k, key, {n.lower() for n in names if n}) for k, key, names in found]
+        if yes_no:                                          # only a yes/no answers an approval or the restart question
+            found = [f for f in found if f[0] in ("approval", "restart")]
+        else:
+            found = [f for f in found if f[0] not in ("approval", "restart")]
+        named = [f for f in found if any(re.search(r"(?<!\w)%s(?!\w)" % re.escape(n), low) for n in f[2])]
+        if named:
+            found = named
+        if low in DO_IT_WORDS:
+            found = [f for f in found if f[0] == "question"]
+        return found
+
+    def _item_label(self, person, kind, key):
+        """How the ask-back list shows an item."""
+        if kind in ("approval", "question"):
+            a = self.state.get(key) or {}
+            q = short_text(a.get("text") or "", CLARIFY_CHARS)
+            if kind == "approval":
+                return 'Ask %s: "%s"' % (shown(a.get("to_name") or a.get("to")), q)
+            return '%s\'s question: "%s"' % (shown(a.get("from_name") or a.get("from")), q)
+        if kind == "restart":
+            handler = (self.pending.get(person["linux_user"]) or (None,))[0]
+            return {self.on_new_session: "Start a new session", self.on_switch: "Switch session"}.get(
+                handler, "Restart your agent")
+        if kind == "task":
+            words = self.task_labels.get(key)
+            return 'Your last task: "%s"' % words if words else "Your last task"
+        return "A new task"
+
+    def _ask_back(self, person, space, body, thread, found, yes_no):
+        """More than one item fits: list them and keep the message (in memory only) until the person picks."""
+        user = person["linux_user"]
+        targets = [{"kind": k, "key": key, "names": sorted(names)} for k, key, names in found]
+        if not yes_no:
+            targets.append({"kind": "new", "key": None, "names": []})
+        lines = ["Which one is this for?"]
+        lines += ["%d. %s" % (i, self._item_label(person, t["kind"], t["key"])) for i, t in enumerate(targets, 1)]
+        lines.append("Reply with the number or the name.")
+        self.clarify[user] = {"text": body, "thread": thread, "targets": targets, "created_at": self.now()}
+        self.chat.send(space, "\n".join(lines))
+        log.info("asked %s which of %d items a message is for", user, len(targets))
+
+    def _on_clarify_pick(self, person, space, text):
+        """True when the message picked from a pending "Which one is this for?" (a number, a name that fits exactly
+        one item, or "new"); the kept message then goes there. Anything else drops the list and is handled afresh."""
+        user = person["linux_user"]
+        c = self.clarify.pop(user, None)
+        if not c or self.now() - c["created_at"] >= CLARIFY_SECONDS:
+            return False
+        pick, targets = (text or "").strip().lower().rstrip(".!"), c["targets"]
+        chosen = None
+        if pick.isdigit():
+            if 1 <= int(pick) <= len(targets):
+                chosen = targets[int(pick) - 1]
+        elif pick == "new":
+            chosen = next((t for t in targets if t["kind"] == "new"), None)
+        else:
+            hits = [t for t in targets if pick and pick in t["names"]]
+            chosen = hits[0] if len(hits) == 1 else None
+        if chosen is None:
+            return False
+        self._send_to(person, space, chosen["kind"], chosen["key"], c["text"], c["thread"])
+        return True
+
+    def _send_to(self, person, space, kind, key, body, thread):
+        """Hand the message to the item it is for, through the handler a reply in that item's thread uses, so every
+        check (still open, not decided, own DM, secret, length, limits, busy) applies as before."""
+        user = person["linux_user"]
+        if kind == "restart":
+            if body.lower() in YES_WORDS:
+                self.on_yes(person, space)
+            else:
+                self.pending.pop(user, None)
+                self.chat.send(space, "OK, I'll leave it.")
+            return
+        if kind == "new":
+            self.on_task(person, space, body, thread)
+            return
+        self._keep_thread(key, {"approval": "approval", "question": "received", "task": "task"}[kind], thread)
+        if kind == "approval":
+            self._on_approval(space, key, body)
+        elif kind == "question":
+            self._on_received(person, space, key, body)
+        else:
+            task = self.state.get(key)
+            if task and task.get("user") == user:
+                self.on_task_reply(person, space, task, body)
+            else:
+                self.on_task(person, space, body, thread)
+
+    def _keep_thread(self, key, role, thread):
+        """Remember another thread of an item; never fails the message."""
+        try:
+            self.state.add_thread(key, role, thread)
+        except Exception as e:                              # noqa: BLE001
+            log.warning("could not keep a thread of %s: %s", key, e.__class__.__name__)
 
     def on_hi(self, person, space):
         name, user = person["name"], person["linux_user"]
@@ -764,7 +934,7 @@ class Bridge:
     def on_yes(self, person, space):
         waiting = self.pending.pop(person["linux_user"], None)
         if not waiting or waiting[2] < self.now():
-            self.chat.send(space, "Nothing is waiting for a yes. Say \"help\" for what I can do.")
+            self.chat.send(space, NOTHING_WAITING)
             return
         handler, arg, _ = waiting
         handler(person, space, arg, confirmed=True)
@@ -903,11 +1073,14 @@ class Bridge:
         rc, out = self.host.agent_job(person["linux_user"], args)
         self.chat.send(space, (out or ("done" if rc == 0 else "that did not work")).strip()[:3000])
 
-    # ---- tasks from Chat: each task is its own headless conversation of the person's agent, in its own thread
-    def _reply(self, space, text, thread=None):
-        if thread:
-            return self.chat.send(space, text, thread=thread)
-        return self.chat.send(space, text)
+    # ---- tasks from Chat: each task is its own headless conversation of the person's agent
+    def _reply(self, space, text, keep=None):
+        """Post at the top level: plain chat, the bot never opens or answers in a thread. keep=(key, role) keeps the
+        post's own thread on that task or ask, so a reply made inside it still reaches the item. Returns the thread."""
+        thread = self.chat.send(space, text)
+        if keep:
+            self._keep_thread(keep[0], keep[1], thread)
+        return thread
 
     def _on_thread(self, person, space, found, text):
         """True when the message belonged to a known thread and was handled there."""
@@ -922,29 +1095,30 @@ class Bridge:
         of an ask they received. Always True: a message in an ask's thread is never a command or a task."""
         user, ask_id = person["linux_user"], item["ask"]
         thread = item.get({"approval": "approval_thread", "copy": "copy_thread"}.get(role, "received_thread")) or ""
-        if not thread.startswith(space + "/"):              # only the person's own DM space counts
+        if not thread.startswith(space + "/"):              # only the person's own DM space counts (the item's first
+            # thread names the space it was posted in; the later ones are in the same DM)
             log.warning("ignored a message for ask %s from %s: not in their own DM", ask_id, user)
             return True
         if role == "approval":
-            self._on_approval(space, ask_id, thread, text)
+            self._on_approval(space, ask_id, text)
         elif role == "copy":
-            self._on_copy(person, space, ask_id, thread, text)
+            self._on_copy(person, space, ask_id, text)
         else:
-            self._on_received(person, space, ask_id, thread, text)
+            self._on_received(person, space, ask_id, text)
         return True
 
-    def _usable_text(self, user, space, text, thread=None):
+    def _usable_text(self, user, space, text):
         """The task text, or None when it must not be run (blank: ignored; too long or a secret: refused)."""
         body = (text or "").strip()
         if not body:
             return None
         if len(body) > TASK_MAX_CHARS:
-            self._reply(space, TOO_LONG, thread)
+            self._reply(space, TOO_LONG)
             return None
         if looks_secret(body):
             log.info("refused a message from %s: it looks like a secret (where=task)", user)
             self._audit(user, "secret_blocked", where="task")
-            self._reply(space, SECRET_REFUSED, thread)
+            self._reply(space, SECRET_REFUSED)
             return None
         return body
 
@@ -956,9 +1130,9 @@ class Bridge:
         return {"mode": "task", "prompt": prompt, "session_uuid": session_uuid, "resume": resume, "ask": None,
                 "asker": None}
 
-    def _launch(self, user, space, thread, ref, request, count=False):
-        """Start the run (never waits for it). On failure the task goes idle and the person is told in its thread.
-        count: a reply in the task's thread, counted against the daily limit only once it has started."""
+    def _launch(self, user, space, ref, request, count=False):
+        """Start the run (never waits for it). On failure the task goes idle and the person is told.
+        count: a next turn of the task, counted against the daily limit only once it has started."""
         ok = False
         try:
             ok = bool(self.host.launch_run(user, ref, request))
@@ -976,10 +1150,11 @@ class Bridge:
             self.state.update(ref, status="failed", run_status="idle", request=None, last_at=self.now(),
                               count_on_launch=False)
             self._audit(user, "chat_task", task=ref, chars=chars, phase="failed")
-            self._reply(space, "I couldn't start your agent just now. Try again in a minute.", thread)
+            self._reply(space, "I couldn't start your agent just now. Try again in a minute.", (ref, "task"))
         return ok
 
-    def on_task(self, person, space, text):
+    def on_task(self, person, space, text, thread=None):
+        """A new task. thread: the message's own thread, kept on the task (a redelivery of it then finds the task)."""
         user = person["linux_user"]
         body = self._usable_text(user, space, text)
         if body is None:
@@ -988,9 +1163,8 @@ class Bridge:
             self.chat.send(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day)
             return
         with self.run_lock:
-            busy = self._busy_task(user)
-            if busy:
-                self.chat.send(space, "Still working on your last task (#%s)." % busy["ref"][1:])
+            if self._busy_task(user):
+                self.chat.send(space, STILL_LAST_MESSAGE)
                 return
             slot = self.state.running() < self.cfg.chat_runs_at_once     # read first: new_task counts as running
             session_uuid = str(uuid.uuid4())
@@ -998,43 +1172,44 @@ class Bridge:
             request = self._request(body, session_uuid, resume=False)
             if not slot:                                   # held (root-only state) until check_outbox finds a slot
                 self.state.update(ref, status="queued", run_status="queued", request=request)
+            self.task_labels[ref] = short_text(body, CLARIFY_CHARS)
+            while len(self.task_labels) > TASK_LABELS_KEPT:
+                self.task_labels.pop(next(iter(self.task_labels)))
             try:
-                thread = self.chat.send(space, ON_IT % ref[1:] + ("" if slot else QUEUED_NOTE), new_thread=True)
+                posted = self.chat.send(space, ON_IT + ("" if slot else QUEUED_NOTE))
             except Exception:
                 self.state.update(ref, status="failed", run_status="idle", request=None)
                 raise
-            self.state.update(ref, thread=thread)
+            self.state.update(ref, thread=posted)
+            self._keep_thread(ref, "task", thread)
             if slot:
-                self._launch(user, space, thread, ref, request)
+                self._launch(user, space, ref, request)
             else:
                 log.info("chat task %s for %s waits for a free slot", ref, user)
 
     def on_task_reply(self, person, space, task, text):
-        """A message in a task's thread: the next turn of that same conversation."""
-        user, ref, thread = person["linux_user"], task["ref"], task.get("thread")
-        body = self._usable_text(user, space, text, thread)
+        """The next turn of a task's conversation: a message in one of its threads, or a plain message while it is
+        the person's recent task."""
+        user, ref = person["linux_user"], task["ref"]
+        body = self._usable_text(user, space, text)
         if body is None:
             return
         with self.run_lock:
             task = self.state.get(ref) or task
-            if task.get("run_status") in RUN_BUSY:
-                self._reply(space, STILL_LAST_MESSAGE, thread)
-                return
-            other = self._busy_task(user)
-            if other:
-                self._reply(space, "Still working on your last task (#%s)." % other["ref"][1:], thread)
+            if task.get("run_status") in RUN_BUSY or self._busy_task(user):
+                self._reply(space, STILL_LAST_MESSAGE)
                 return
             if self.state.count_today("task", user) >= self.cfg.chat_tasks_per_day:   # a reply is a run too
-                self._reply(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day, thread)
+                self._reply(space, "You've used today's %d Chat tasks." % self.cfg.chat_tasks_per_day)
                 return
             request = self._request(body, task["session_uuid"], resume=bool(task.get("launched")))
             if self.state.running() < self.cfg.chat_runs_at_once:   # counted for today once it has started
-                if self._launch(user, space, thread, ref, request, count=True):
-                    self._reply(space, "On it.", thread)
+                if self._launch(user, space, ref, request, count=True):
+                    self._reply(space, ON_IT, (ref, "task"))
             else:
                 self.state.update(ref, status="queued", run_status="queued", request=request, last_at=self.now(),
                                   count_on_launch=True)
-                self._reply(space, "Got it." + QUEUED_NOTE, thread)
+                self._reply(space, "Got it." + QUEUED_NOTE, (ref, "task"))
 
     def _person_of(self, user):
         return next((p for p in self.store.all() if p.get("linux_user") == user), None)
@@ -1056,19 +1231,17 @@ class Bridge:
         if status not in ("ok", "needs_you", "failed"):
             status = "failed"
         self.state.update(ref, status=status, run_status="idle", last_at=self.now())   # before posting: a Chat error
-        n, limit = ref[1:], self.cfg.chat_result_chars                                 # must not hold the slot
+        limit = self.cfg.chat_result_chars                                             # must not hold the slot
         if looks_secret(text):
             log.info("did not post the result of %s for %s: it looks like a secret (where=result)", ref, user)
             self._audit(user, "secret_blocked", where="result")
-            post = ("Task #%s finished, but its answer looks like it holds a secret, so I did not post it. To read it, %s."
-                    % (n, RESULTS_HINT % ref))
-        else:
-            body = text if len(text) <= limit else text[:limit].rstrip() + "\n… full result: " + RESULTS_HINT % ref
-            post = {"needs_you": "Task #%s needs you:\n%s", "failed": "Task #%s failed:\n%s"}.get(status, "%s%s")
-            post = post % (("", body) if status == "ok" else (n, body))
+            post = ("Done, but the answer looks like it holds a secret, so I did not post it. To read it, %s."
+                    % (RESULTS_HINT % ref))
+        else:                                              # as it is: NEEDS YOU lines and failures speak for themselves
+            post = text if len(text) <= limit else text[:limit].rstrip() + "\n… full result: " + RESULTS_HINT % ref
         self._audit(user, "chat_task", task=ref, chars=len(text), phase="done" if status == "ok" else status)
         try:
-            self._reply(p["chat_space"], post, task.get("thread"))
+            self._reply(p["chat_space"], post, (ref, "task"))
         except Exception:                                  # noqa: BLE001
             log.exception("could not post the result of %s for %s", ref, user)
             return False
@@ -1099,37 +1272,39 @@ class Bridge:
             return None
         return ref
 
-    def _post_to_task(self, ask, outcome, text, by=None):
-        """Post an ask's outcome in the asker's Chat task thread, or else their DM. "thread", "dm", or None when
-        neither could be posted (the caller then takes the inbox path, whose DM fallback retries)."""
+    @staticmethod
+    def _answer_post(ask, text, by, correction=False):
+        """An answer as the asker reads it: "Ravi: ...", "Ravi's agent: ..." or "Ravi (correction): ..."."""
+        name = shown(ask.get("to_name") or ask.get("to") or "")
+        if correction:
+            return ASK_CORRECTION_POST % (name, text)
+        return ASK_ANSWER % (name + ("'s agent" if by == "agent" else ""), text)
+
+    def _post_to_task(self, ask, outcome, text, by=None, correction=False):
+        """Tell the asker of an ask from a Chat task its outcome: "thread" (posted as part of that task: a reply in
+        the post's thread continues it), "dm" (posted with no task to join), or None when it could not be posted (the
+        caller then takes the inbox path, whose DM fallback retries). A decline or an expiry is not posted here: the
+        person was told already ("Not sent." where they said no; the expiry note), once is enough."""
         user, ref = ask["from"], ask.get("reply_task")
         p = self._person_of(user)
         if not p or not p.get("chat_space"):
             return None
-        q = short_text(ask.get("text") or "", THREAD_QUESTION_CHARS)
-        name = shown(ask.get("to_name") or ask.get("to") or "")
-        if outcome == "answered":
-            who = name + ("'s agent" if by == "agent" else "")
-            post, dm = THREAD_ANSWER % (who, q, text), ASK_DM % (who, q, text)
-        else:
-            post = dm = THREAD_NOT_SENT % (name, q, THREAD_WHY.get(outcome, text))
         task = self.state.get(ref) if ref else None
-        if task and task.get("user") == user and task.get("thread"):
+        via = "thread" if task and task.get("user") == user and task.get("thread") else "dm"
+        if outcome in ("declined", "expired"):
+            return via
+        post = self._answer_post(ask, text, by, correction) if outcome == "answered" else text
+        for how in ((via, "dm") if via == "thread" else ("dm",)):
             try:
-                self._reply(p["chat_space"], post, task["thread"])
-                return "thread"
-            except Exception as e:                         # noqa: BLE001 - the DM is next
-                log.warning("could not post ask %s in task %s for %s: %s", ask["ask"], ref, user, e.__class__.__name__)
-        try:
-            self.chat.send(p["chat_space"], dm)
-            return "dm"
-        except Exception as e:                             # noqa: BLE001
-            log.warning("could not DM ask %s to %s: %s", ask["ask"], user, e.__class__.__name__)
-            return None
+                self._reply(p["chat_space"], post, (ref, "task") if how == "thread" else None)
+                return how
+            except Exception as e:                         # noqa: BLE001 - tried once more, then the inbox path
+                log.warning("could not post ask %s for %s (%s): %s", ask["ask"], user, how, e.__class__.__name__)
+        return None
 
     def _refuse_ask(self, user, ask_id, name, outcome, why, reply_task=None, text=""):
         """Straight back to the waiter (refused / limit): no state row, nothing posted to anyone. For an ask from a
-        Chat task the reason is posted in that task's thread instead."""
+        Chat task the reason is posted to the asker instead."""
         log.info("ask %s from %s: %s", ask_id, user, outcome)
         if reply_task and self._post_to_task({"ask": ask_id, "from": user, "to": name, "to_name": name,
                                               "text": text, "reply_task": reply_task}, outcome, why):
@@ -1151,15 +1326,15 @@ class Bridge:
             return self._refuse_ask(user, ask_id, name, outcome, why, task, quoted)
         target = self.store.get(name)
         if target is None:
-            return refuse("refused", "There is no colleague called %s on the box." % name)
+            return refuse("refused", "There's no colleague called \"%s\"." % short_text(str(name), 40))
         if target.get("linux_user") == user:
-            return refuse("refused", "You cannot ask yourself; ask a colleague by name.")
+            return refuse("refused", "You can't ask yourself.")
         if target.get("status") != "active" or not target.get("chat_space"):
-            return refuse("refused", "%s has not set up their agent yet, so they cannot be asked." % shown(name))
+            return refuse("refused", "%s hasn't set up their agent yet." % shown(name))
         if self.state.count_today("ask_sent", user) >= self.cfg.asks_per_day:
-            return refuse("limit", "Limit reached: your agent has asked %d questions today." % self.cfg.asks_per_day)
+            return refuse("limit", "You've asked %d questions today, the daily limit." % self.cfg.asks_per_day)
         if self.state.count_today("ask_received", target["linux_user"]) >= self.cfg.asks_received_per_day:
-            return refuse("limit", "Limit reached: %s has had %d questions today."
+            return refuse("limit", "%s has had %d questions today, the daily limit."
                           % (shown(name), self.cfg.asks_received_per_day))
         if looks_secret(text):
             log.info("refused ask %s from %s: it looks like a secret (where=ask)", ask_id, user)
@@ -1170,7 +1345,7 @@ class Bridge:
         ask = self.state.update(ask_id, from_name=p["name"], to_name=target["name"], **extra)
         self._audit_ask(ask, "requested", len(text))
         try:
-            thread = self.chat.send(p["chat_space"], ASK_OK % (shown(target["name"]), text), new_thread=True)
+            thread = self.chat.send(p["chat_space"], ASK_OK % (shown(target["name"]), short_text(text, ASK_OK_CHARS)))
         except Exception as e:                             # noqa: BLE001
             log.warning("could not ask %s to approve ask %s: %s", user, ask_id, e.__class__.__name__)
             self.state.close(ask_id)                       # stays awaiting_ok: never counted as the colleague's
@@ -1186,47 +1361,47 @@ class Bridge:
             return None
         return ask
 
-    def _on_approval(self, space, ask_id, thread, text):
+    def _on_approval(self, space, ask_id, text):
         low = (text or "").strip().lower()
         if not low:
             return
         with self.run_lock:
             ask = self._open_ask(ask_id, "awaiting_ok")
             if ask is None:                                # decided already (or a redelivery after a restart)
-                self._reply(space, ASK_DECIDED, thread)
+                self._reply(space, ASK_DECIDED)
                 return
             if low in NO_WORDS:
                 self.state.update(ask_id, status="declined")
                 self._audit_ask(ask, "declined", len(ask["text"]))
                 self._deliver(ask, "declined", "%s did not approve this question." % shown(ask["from_name"]))
-                self._reply(space, "OK, not sent.", thread)
+                self._reply(space, ASK_NOT_SENT)
                 return
             if low not in YES_WORDS:
-                self._reply(space, "Reply yes or no here.", thread)
+                self._reply(space, "Reply yes or no.")
                 return
             self.state.update(ask_id, status="asking_agent")
             self._audit_ask(ask, "approved", len(ask["text"]))
-            self._reply(space, ASK_SENT % shown(ask["to_name"]), thread)
+            self._reply(space, ASK_SENT % shown(ask["to_name"]))
             request = {"mode": "ask", "prompt": ask["text"], "session_uuid": str(uuid.uuid4()), "resume": False,
                        "ask": ask_id, "asker": ask["from_name"]}
             self._start_ask_run(ask_id, ask_id, request)
 
-    def _on_received(self, person, space, ask_id, thread, text):
-        """The colleague, in the thread of a question they were handed: their answer, or "do it"."""
+    def _on_received(self, person, space, ask_id, text):
+        """The colleague, about a question they were handed: their answer, or "do it"."""
         user, body = person["linux_user"], (text or "").strip()
         if not body:
             return
         with self.run_lock:
             ask = self._open_ask(ask_id, "with_person")
             if ask is None:
-                self._reply(space, "That question is already answered.", thread)
+                self._reply(space, "That question is already answered.")
                 return
             if len(body) > TASK_MAX_CHARS:
-                self._reply(space, TOO_LONG, thread)
+                self._reply(space, TOO_LONG)
                 return
             if body.lower() in DO_IT_WORDS:
                 if ask.get("run_status") in RUN_BUSY:
-                    self._reply(space, "Your agent is already on it.", thread)
+                    self._reply(space, "Your agent is already on it.")
                     return
                 request = {"mode": "doit", "session_uuid": str(uuid.uuid4()), "resume": False, "ask": ask_id,
                            "asker": ask["from_name"], "prompt": DOIT_PROMPT % (
@@ -1235,19 +1410,18 @@ class Bridge:
                 started = self._start_ask_run(ask_id, "d" + ask_id[1:], request)
                 if started:
                     self._audit_ask(ask, "do_it", len(ask["text"]))
-                    self._reply(space, "On it. I'll post the result here." if started is True
-                                else "Got it." + QUEUED_NOTE, thread)
+                    self._reply(space, ON_IT if started is True else "Got it." + QUEUED_NOTE, (ask_id, "received"))
                 return
             if looks_secret(body):
                 log.info("refused an answer to ask %s from %s: it looks like a secret (where=answer)", ask_id, user)
                 self._audit(user, "secret_blocked", where="answer")
-                self._reply(space, SECRET_REFUSED, thread)
+                self._reply(space, SECRET_REFUSED)
                 return
             self._audit_ask(ask, "answered", len(body))
             self._deliver(ask, "answered", body, by="person")
-            self._reply(space, "Sent to %s." % shown(ask["from_name"]), thread)
+            self._reply(space, ASK_SENT % shown(ask["from_name"]))
 
-    def _on_copy(self, person, space, ask_id, thread, text):
+    def _on_copy(self, person, space, ask_id, text):
         """The colleague, in the thread of the copy of their agent's answer: their own answer, sent to the asker as a
         correction while the ask is open (an asker who already read the first answer gets it in their DM)."""
         user, body = person["linux_user"], (text or "").strip()
@@ -1256,20 +1430,19 @@ class Bridge:
         with self.run_lock:
             ask = self.state.get(ask_id)
             if not ask or ask.get("closed_at") is not None:
-                self._reply(space, ASK_ALREADY_DELIVERED % shown((ask or {}).get("from_name") or "your colleague"),
-                            thread)
+                self._reply(space, ASK_ALREADY_DELIVERED % shown((ask or {}).get("from_name") or "your colleague"))
                 return
             if len(body) > TASK_MAX_CHARS:
-                self._reply(space, TOO_LONG, thread)
+                self._reply(space, TOO_LONG)
                 return
             if looks_secret(body):
                 log.info("refused a correction to ask %s from %s: it looks like a secret (where=answer)", ask_id, user)
                 self._audit(user, "secret_blocked", where="answer")
-                self._reply(space, SECRET_REFUSED, thread)
+                self._reply(space, SECRET_REFUSED)
                 return
             self._audit_ask(ask, "corrected", len(body))
-            self._deliver(ask, "answered", ASK_CORRECTION % (shown(ask["to_name"]), body), by="person")
-            self._reply(space, ASK_CORRECTED % shown(ask["from_name"]), thread)
+            self._deliver(ask, "answered", body, by="person", correction=True)
+            self._reply(space, ASK_CORRECTED % shown(ask["from_name"]))
 
     def _start_ask_run(self, ask_id, ref, request):
         """An ask's answer run (ref a…) or do-it run (d…) in the colleague's account. True started, "queued" waiting for
@@ -1295,24 +1468,24 @@ class Bridge:
         if ref.startswith("a"):                            # the agent cannot try: the person decides
             self._hand_to_person(ask_id)
         else:
-            self._post_received(ask, "I couldn't start your agent just now. Say do it again in a minute, or answer "
-                                     "here yourself.")
+            self._post_received(ask, "I couldn't start your agent just now. Say \"do it\" again in a minute, or "
+                                     "answer it yourself.")
         return False
 
     def _post_received(self, ask, text):
-        """Post in the thread of the ask the colleague received."""
+        """Post to the colleague about the ask they received (its thread kept: a reply in it answers)."""
         colleague = self._person_of(ask["to"])
         if not colleague or not colleague.get("chat_space"):
             return False
         try:
-            self._reply(colleague["chat_space"], text, ask.get("received_thread"))
+            self._reply(colleague["chat_space"], text, (ask["ask"], "received"))
             return True
         except Exception as e:                             # noqa: BLE001
             log.warning("could not post to %s about ask %s: %s", ask["to"], ask["ask"], e.__class__.__name__)
             return False
 
     def _hand_to_person(self, ask_id, note=""):
-        """The colleague's agent could not answer: open a thread for the colleague. Retried by check_asks when the
+        """The colleague's agent could not answer: hand the question to the colleague. Retried by check_asks when the
         post fails. Called under run_lock (or from check_asks)."""
         ask = self.state.update(ask_id, status="with_person", run_status="idle")
         colleague = self._person_of(ask["to"])
@@ -1321,24 +1494,29 @@ class Bridge:
             return
         try:
             thread = self.chat.send(colleague["chat_space"], ASK_TO_PERSON % (shown(ask["from_name"]), ask["text"])
-                                    + note, new_thread=True)
+                                    + note)
         except Exception as e:                             # noqa: BLE001
             log.warning("could not hand ask %s to %s: %s", ask_id, ask["to"], e.__class__.__name__)
             return
         self.state.update(ask_id, received_thread=thread, handed_at=self.now())
         self._audit_ask(ask, "to_person", len(ask["text"]))
 
-    def _deliver(self, ask, outcome, text, by=None):
+    def _deliver(self, ask, outcome, text, by=None, correction=False):
         """Write the outcome to the asker's inbox, where the waiting ask-colleague picks it up. check_asks DMs an
-        unread answer (and cleans up any unread outcome) after ASK_DM_FALLBACK_SECONDS, then closes the ask."""
+        unread answer (and cleans up any unread outcome) after ASK_DM_FALLBACK_SECONDS, then closes the ask.
+        correction: the colleague's own answer after their agent's; the inbox says so in words for the agent, the
+        person reads "Ravi (correction): ..."."""
         ask_id = ask["ask"]
-        body = self._inbox_body(ask_id, outcome, ask["to_name"], text, by)
+        said = ASK_CORRECTION % (shown(ask["to_name"]), text) if correction else text
+        body = self._inbox_body(ask_id, outcome, ask["to_name"], said, by)
+        answer = self._inbox_body(ask_id, outcome, ask["to_name"], text)["text"]          # cut like the inbox text
         fields = {"status": outcome, "outcome": outcome, "by": by, "delivered_at": self.now(),
-                  "answer": body["text"] if outcome == "answered" else None}   # for the DM; dropped on close
+                  "answer": answer if outcome == "answered" else None,               # for the DM; dropped on close
+                  "correction": bool(correction)}
         if self.state.get(ask_id).get("run_status") == "queued":   # a waiting run for a decided question never starts
             fields.update(run_status="idle", run_ref=None, request=None)
-        if ask.get("reply_task"):                          # from a Chat task: posted in its thread (or DM), no inbox
-            via = self._post_to_task(ask, outcome, body["text"], by)
+        if ask.get("reply_task"):                          # from a Chat task: posted to the asker, no inbox
+            via = self._post_to_task(ask, outcome, answer, by, correction)
             if via:
                 fields.update(delivered_via=via, answer=None)
                 ask = self.state.update(ask_id, **fields)
@@ -1360,7 +1538,7 @@ class Bridge:
         """End of delivery: an answer nobody picked up goes to the asker's DM; any unread file is removed; the ask is
         closed (text and answer dropped). False when the DM could not be posted (tried again next time)."""
         ask_id, user = ask["ask"], ask["from"]
-        if ask.get("delivered_via"):                       # already posted in a Chat task thread or the DM
+        if ask.get("delivered_via"):                       # already posted to the asker
             unread = False
         if unread is None:
             try:
@@ -1375,13 +1553,13 @@ class Bridge:
                 log.warning("could not remove the unread answer to ask %s for %s: %s", ask_id, user, e.__class__.__name__)
             if ask.get("outcome") == "answered":
                 p = self._person_of(user)
-                who = shown(ask["to_name"]) + ("'s agent" if ask.get("by") == "agent" else "")
                 answer = ask.get("answer") or ""
                 if not p or not p.get("chat_space"):
                     log.warning("ask %s: %s cannot be reached in Chat; the answer is dropped", ask_id, user)
                 else:
                     try:
-                        self.chat.send(p["chat_space"], ASK_DM % (who, short_text(ask.get("text") or "", 100), answer))
+                        self.chat.send(p["chat_space"], self._answer_post(ask, answer, ask.get("by"),
+                                                                          ask.get("correction")))
                     except Exception as e:                 # noqa: BLE001
                         log.warning("could not DM the answer to ask %s to %s: %s", ask_id, user, e.__class__.__name__)
                         return False
@@ -1425,13 +1603,14 @@ class Bridge:
             return True
         self._audit_ask(ask, "auto_answered", len(text))
         self._deliver(ask, "answered", text, by="agent")
-        limit = self.cfg.chat_result_chars
-        copy = text if len(text) <= limit else text[:limit].rstrip() + "…"
+        copy = short_text(text, ASK_COPY_ANSWER_CHARS)
+        if not copy.endswith((".", "!", "?", "\u2026")):
+            copy += "."                                    # one full stop before "Reply to correct it."
         colleague = self._person_of(ask["to"])
         if colleague and colleague.get("chat_space"):
             try:
                 thread = self.chat.send(colleague["chat_space"], ASK_COPY % (
-                    shown(ask["from_name"]), short_text(ask["text"], ASK_COPY_QUESTION_CHARS), copy), new_thread=True)
+                    shown(ask["from_name"]), short_text(ask["text"], ASK_COPY_QUESTION_CHARS), copy))
                 if thread:                                 # a reply there is the colleague's correction
                     self.state.update(ask["ask"], copy_thread=thread)
             except Exception as e:                         # noqa: BLE001
@@ -1439,11 +1618,11 @@ class Bridge:
         return True
 
     def _on_doit_run(self, ask, ref, status, text):
-        """Posted in the colleague's thread; only a clean result of a still-open ask goes to the asker."""
+        """Posted to the colleague; only a clean result of a still-open ask goes to the asker."""
         if status not in ("ok", "needs_you", "failed"):
             status = "failed"
         open_ = ask.get("status") == "with_person" and ask.get("closed_at") is None
-        again = " Nothing was sent to %s. Reply here to answer, or say do it again." % shown(ask["from_name"])
+        again = " Nothing was sent to %s. Reply to answer, or say \"do it\" again." % shown(ask["from_name"])
         limit = self.cfg.chat_result_chars
         if looks_secret(text):
             log.info("did not post or send the result of %s: it looks like a secret (where=answer)", ref)
@@ -1456,9 +1635,8 @@ class Bridge:
             send = status == "ok" and open_
             if status == "ok":
                 post = body + ("\n(Sent to %s.)" % shown(ask["from_name"]) if send else "")
-            else:
-                post = ("Your agent needs you:\n%s" if status == "needs_you" else "Your agent's run failed:\n%s") % body
-                post += again if open_ else ""
+            else:                                          # as it is: NEEDS YOU lines and failures speak for themselves
+                post = body + (("\n" + again.strip()) if open_ else "")
         if send:
             self._audit_ask(ask, "answered", len(text))
             self._deliver(ask, "answered", text, by="agent")
@@ -1470,11 +1648,11 @@ class Bridge:
         for a in self.state.asks():
             if a.get("closed_at") is None:
                 continue
-            if (a["from"] == user and a.get("approval_thread") == thread) or \
-                    (a["to"] == user and a.get("received_thread") == thread):
-                return ASK_CLOSED
-            if a["to"] == user and a.get("copy_thread") == thread:
+            role = ask_thread_role(a, user, thread)
+            if role == "copy":
                 return ASK_ALREADY_DELIVERED % shown(a.get("from_name") or a["from"])
+            if role:
+                return ASK_CLOSED
         return None
 
     def check_asks(self):
@@ -1508,9 +1686,10 @@ class Bridge:
             hours = self.cfg.ask_approval_seconds / 3600.0
             self._deliver(ask, "expired", "%s did not approve it in time." % shown(ask["from_name"]))
         p = self._person_of(ask["from"])
-        if p and p.get("chat_space") and ask.get("approval_thread"):
+        if p and p.get("chat_space"):
             try:
-                self._reply(p["chat_space"], "Not sent: no yes within %g hours." % hours, ask["approval_thread"])
+                self._reply(p["chat_space"], ASK_EXPIRED % (shown(ask.get("to_name") or ask["to"]),
+                                                            "%g hour%s" % (hours, "" if hours == 1 else "s")))
             except Exception as e:                         # noqa: BLE001
                 log.warning("could not tell %s ask %s expired: %s", ask["from"], ask_id, e.__class__.__name__)
         return True
@@ -1528,7 +1707,7 @@ class Bridge:
                     self._hand_to_person(a["ask"])
                 elif ref.startswith("d"):
                     self._post_received(a, "Your agent stopped without an answer (it ran out of time or memory). "
-                                           "Reply here to answer, or say do it again.")
+                                           "Reply to answer, or say \"do it\" again.")
             for t in self.state.tasks():
                 if t.get("run_status") != "running" or self.now() - float(t.get("last_at") or 0) <= RUN_STALE_SECONDS:
                     continue
@@ -1539,8 +1718,8 @@ class Bridge:
                 p = self._person_of(user)
                 if p and p.get("chat_space"):
                     try:
-                        self._reply(p["chat_space"], "Task #%s stopped without an answer (it ran out of time or memory). "
-                                                     "Reply here to try again." % ref[1:], t.get("thread"))
+                        self._reply(p["chat_space"], "Your task stopped without an answer (it ran out of time or "
+                                                     "memory). Send your message again to retry.", (ref, "task"))
                     except Exception:                      # noqa: BLE001
                         log.exception("could not tell %s about %s", user, ref)
 
@@ -1563,7 +1742,7 @@ class Bridge:
                     log.warning("dropped queued chat run %s for %s: person no longer active", ref, user)
                     continue
                 try:
-                    self._launch(user, p["chat_space"], t.get("thread"), ref, t["request"],
+                    self._launch(user, p["chat_space"], ref, t["request"],
                                  count=bool(t.get("count_on_launch")))
                 except Exception:                          # noqa: BLE001 - one person's Chat error must not stop the rest
                     log.exception("could not start queued chat run %s for %s", ref, user)

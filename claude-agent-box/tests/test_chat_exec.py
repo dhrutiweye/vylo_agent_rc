@@ -108,7 +108,11 @@ class TestArgv(unittest.TestCase):
             argv = self.m.build_argv(mode, req(mode))
             return argv[argv.index("--append-system-prompt") + 1]
         self.assertIn("ask-colleague --no-wait", preamble("task"))
-        self.assertIn("posted in this Chat thread", preamble("task"))
+        self.assertIn("posted in Chat", preamble("task"))
+        self.assertIn('"Asked Yogesh."', preamble("task"))                  # plain chat: say so briefly
+        self.assertIn("do not add a NEEDS YOU line for the approval", preamble("task"))
+        for mode in ("task", "doit"):
+            self.assertNotIn("thread", preamble(mode))
         self.assertNotIn("ask-colleague", preamble("doit")); self.assertNotIn("ask-colleague", preamble("ask"))
         self.assertIn("NEEDS YOU:", preamble("doit"))
 

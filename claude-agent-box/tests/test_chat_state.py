@@ -180,6 +180,31 @@ class TestChatState(Base):
         self.st.close("a0123456789")
         self.assertIsNone(self.st.item_by_thread("ravi", "spaces/R/threads/CP"))
 
+    def test_more_threads_of_an_item_route_to_it(self):
+        # plain chat: each bot post about an item, and each message routed to it, is its own thread
+        self.st.new_task("asha", "T1", "u1")
+        self.st.add_thread("t1", "task", "T9")
+        self.assertEqual(self.st.item_by_thread("asha", "T9")[1]["ref"], "t1")
+        self.assertEqual(self.st.item_by_thread("asha", "T1")[1]["ref"], "t1")
+        self.assertIsNone(self.st.item_by_thread("ravi", "T9"))
+        self.st.new_ask("asha", "ravi", "q", "a0123456789")
+        self.st.add_thread("a0123456789", "received", "R9")
+        self.st.add_thread("a0123456789", "approval", "A9")
+        self.assertEqual(self.st.item_by_thread("ravi", "R9")[0], "received")
+        self.assertIsNone(self.st.item_by_thread("asha", "R9"))
+        self.assertEqual(self.st.item_by_thread("asha", "A9")[0], "approval")
+        self.assertIsNone(self.st.item_by_thread("ravi", "A9"))
+        self.st.add_thread("a0123456789", "received", None)               # nothing to keep
+        for i in range(30):
+            self.st.add_thread("t1", "task", "X%d" % i)
+        self.assertEqual(len(self.st.get("t1")["threads"]), 20)
+        self.assertIsNotNone(self.st.item_by_thread("asha", "X29"))
+        self.assertIsNone(self.st.item_by_thread("asha", "X0"))
+        self.st.add_thread("t404", "task", "T5")                           # no such item: nothing happens
+        self.assertIsNone(self.st.item_by_thread("asha", "T5"))
+        self.st.close("a0123456789")
+        self.assertIsNone(self.st.item_by_thread("ravi", "R9"))            # closed asks own no threads
+
     def test_json_that_is_not_an_object_reads_like_a_corrupt_file(self):
         # M10: a list (or a number) on disk must not break every lookup
         for junk in ("[]", "[1, 2]", "7", "null", '"x"'):

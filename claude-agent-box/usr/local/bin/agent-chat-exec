@@ -7,7 +7,7 @@ systemd-run in its own capped unit, as the colleague; not meant to be run by han
 Reads and deletes ~/.claude/chat-requests/REF.json, which the bridge wrote:
     {"mode": "task" | "ask" | "doit", "prompt": str, "session_uuid": str, "resume": bool, "ask": str|None,
      "asker": str|None}
-then runs a headless `claude -p` in the vylo folder: --session-id on a thread's first message, --resume for a reply in
+then runs a headless `claude -p` in the vylo folder: --session-id on a task's first message, --resume for a next turn in
 it. The prompt goes in on stdin, never on the command line (a DM starting with "-" is not an option, and other users
 cannot read it from /proc). CLAUDE_AGENT_JOB=chat-REF (task, doit) or ask-REF (ask) makes the guard refuse, rather
 than ask about, anything needing approval, and tags the audit rows. An ask run gets no Bash, no web, no writes and no
@@ -54,12 +54,14 @@ TASK_BASE = (
     "approve anything: do not wait for input. Anything that needs approval will be refused; when that happens, or "
     "when {user} must do something themselves (deploy, approve, message someone), say so in your final answer on a "
     "line starting with 'NEEDS YOU:'. Do not edit the shared vylo checkout: work in a git worktree. Your final answer "
-    "is posted in the Chat thread, so keep it short (under 1200 characters) and lead with what matters. {user} can "
-    "reply in that thread; the reply continues this conversation."
+    "is posted in Chat as it is, so keep it short (under 1200 characters) and lead with what matters. {user}'s next "
+    "message continues this conversation."
 )
 TASK_PREAMBLE = TASK_BASE + (
     " To ask a colleague, run `ask-colleague --no-wait NAME` with the question on stdin (a heredoc); do not wait for "
-    "the answer: it will be posted in this Chat thread once {user} approves and the colleague answers."
+    "the answer: the bot asks {user} to approve it, and the answer is posted in Chat once the colleague answers. "
+    "After asking, just say so briefly, e.g. \"Asked Yogesh.\", and do not add a NEEDS YOU line for the approval: "
+    "the bot asks {user} for it."
 )
 DOIT_PREAMBLE = TASK_BASE + (
     " This task comes from a colleague's question ({asker}'s agent asked it) that {user} told you to act on; the "
@@ -272,7 +274,7 @@ def main(argv):
     workdir = os.environ.get("AGENT_WORKDIR", os.path.join(home, "Documents", "code", "vylo"))
     env = dict(os.environ, CLAUDE_AGENT_JOB=("ask-" if mode == "ask" else "chat-") + ref)
     env.pop("CHAT_TASK_REF", None)
-    if mode == "task":                      # ask-colleague --no-wait names this task, so its answer lands in the thread
+    if mode == "task":                      # ask-colleague --no-wait names this task, so its answer is posted to its person
         env["CHAT_TASK_REF"] = ref
     try:
         r = subprocess.run(cmd, input=prompt_text(mode, request), cwd=workdir if os.path.isdir(workdir) else home,

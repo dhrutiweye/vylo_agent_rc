@@ -15,6 +15,7 @@ import json
 import os
 
 TASKS_KEPT_PER_USER = 20
+THREADS_KEPT = 20                          # more threads of one item: bot posts about it and messages routed to it
 ASK_KEPT_SECONDS = 7 * 86400
 TASK_LOG_KEPT_SECONDS = 3 * 86400          # per-task creation stamps for the daily limit, outliving the 20-task trim
 NOT_APPROVED = ("awaiting_ok", "declined", "expired")
@@ -27,6 +28,16 @@ def _tz():
         return get_tz("Asia/Kolkata")
     except Exception:                                      # noqa: BLE001
         return IST
+
+
+def ask_thread_role(a, user, thread):
+    """"approval", "received" or "copy" when `thread` is one of ask a's threads on user's side, else None."""
+    threads = [("approval", a.get("approval_thread")), ("received", a.get("received_thread")),
+               ("copy", a.get("copy_thread"))] + [tuple(x) for x in a.get("threads") or []]
+    for role, th in threads:
+        if th and th == thread and user == (a["from"] if role == "approval" else a["to"]):
+            return role                                    # "copy": "Your agent answered ...", a correction
+    return None
 
 
 class ChatState:
@@ -106,6 +117,22 @@ class ChatState:
             d["task_log"] = [e for e in d["task_log"] if now - e[1] < TASK_LOG_KEPT_SECONDS] + [[user, now]]
         self._modify(fn)
 
+    def add_thread(self, key, role, thread):
+        """Another thread that belongs to task or ask `key`. The bot posts everything at the top level, and a plain
+        post starts its own thread, so each post about an item (and each plain message routed to it) is a thread of
+        its own: a reply inside any of them, or a Pub/Sub redelivery of that message, finds the item again. role is
+        "task", or for an ask "approval" (the asker's side), "received" or "copy" (the colleague's)."""
+        if not thread:
+            return
+
+        def fn(d):
+            item = self._find(d, key)
+            if item is None:
+                return
+            kept = [t for t in item.get("threads") or [] if t[1] != thread]
+            item["threads"] = (kept + [[role, thread]])[-THREADS_KEPT:]
+        self._modify(fn)
+
     # ---- asks
     def new_ask(self, from_user, to_user, text, ask_id):
         def fn(d):
@@ -156,17 +183,13 @@ class ChatState:
             return None
         d = self._read()
         for t in d["tasks"]:
-            if t["user"] == user and t["thread"] == thread:
+            if t["user"] == user and thread in [t["thread"]] + [x[1] for x in t.get("threads") or []]:
                 return "task", dict(t)
         for a in d["asks"]:
-            if a.get("closed_at") is not None:
-                continue
-            if a["from"] == user and a.get("approval_thread") == thread:
-                return "approval", dict(a)
-            if a["to"] == user and a.get("received_thread") == thread:
-                return "received", dict(a)
-            if a["to"] == user and a.get("copy_thread") == thread:      # "Your agent answered ...": a correction
-                return "copy", dict(a)
+            if a.get("closed_at") is None:
+                role = ask_thread_role(a, user, thread)
+                if role:
+                    return role, dict(a)
         return None
 
     def count_today(self, kind, user):

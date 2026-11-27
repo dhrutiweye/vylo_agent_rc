@@ -20,12 +20,17 @@ class FakeChat:
     def __init__(self):
         self.sent = []
         self.threads = 0
+        self.threaded = []               # (space, text) of every post that asked for a thread: the bot never does now
 
     def send(self, space, text, thread=None, new_thread=False):
-        """Records (space, text) as before, or (space, text, thread) when a thread was asked for; returns the thread."""
+        """Records (space, text) for a plain post and returns the thread Chat gives it: a new one each time, as a
+        plain post starts its own thread. A post that asks for a thread (thread= or new_thread=True) is recorded as
+        (space, text, thread) and in self.threaded."""
         if thread is None and not new_thread:
+            self.threads += 1
             self.sent.append((space, text))
-            return None
+            return "%s/threads/T%d" % (space, self.threads)
+        self.threaded.append((space, text))
         if not thread:
             self.threads += 1
             thread = "%s/threads/T%d" % (space, self.threads)
@@ -189,6 +194,7 @@ class Base(unittest.TestCase):
         self.store = cb.PeopleStore(self.people)
         self.chat, self.host = FakeChat(), FakeHost()
         self.b = cb.Bridge(self.cfg, self.store, self.chat, self.host, now=lambda: self.clock[0])
+        self.addCleanup(lambda: self.assertEqual(self.chat.threaded, [], "a bot post asked for a thread"))
 
     def person(self, name="asha"):
         return self.store.get(name)
@@ -253,10 +259,11 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(set(posts[-1][1]), {"text", "thread"})
         self.assertEqual(set(posts[-1][1]["thread"]), {"threadKey"})
         self.assertEqual(posts[-1][2], reply)
-        fake = FakeChat()
-        fake.send("spaces/DM1", "plain")
+        fake = FakeChat()                                                    # a plain post starts its own thread
+        self.assertEqual(fake.send("spaces/DM1", "plain"), "spaces/DM1/threads/T1")
         self.assertEqual(fake.sent, [("spaces/DM1", "plain")])
-        self.assertEqual(fake.send("spaces/DM1", "x", new_thread=True), "spaces/DM1/threads/T1")
+        self.assertEqual(fake.send("spaces/DM1", "x", new_thread=True), "spaces/DM1/threads/T2")
+        self.assertEqual(fake.threaded, [("spaces/DM1", "x")])
 
     def test_config_has_the_chat_limits(self):
         c = cb.Config({})
@@ -1052,9 +1059,10 @@ class TestConfirmRemoteControl(unittest.TestCase):
         self.assertFalse(ok); self.assertEqual(h.sent, [])
 
 
-T1 = "spaces/DM1/threads/T1"         # the thread FakeChat hands out for the first new_thread post
-ON_IT = "On it (task #%s). Reply in this thread to add to it."
-STILL_LAST_MESSAGE = "Still working on the last message; send it again when I answer."
+T1 = "spaces/DM1/threads/T1"         # the thread FakeChat hands out for the first post
+ON_IT = "On it."
+STILL_LAST_MESSAGE = "Still working on your last message \u2014 send it again when I answer."
+NOTHING_WAITING = "Nothing is waiting for a yes or no."
 GH_TOKEN = "ghp_" + "Ab3" * 12          # 36 characters after the prefix: a GitHub token shape
 
 
@@ -1092,7 +1100,7 @@ class TestChatTasks(Base):
 
     def test_free_text_starts_a_task_in_a_new_thread(self):
         self.b.handle_event(classic("fix the login bug", thread="spaces/DM1/threads/U1"))
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", ON_IT % 1, T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", ON_IT))                 # at the top level, its own thread T1
         launches = self.host.launches()
         self.assertEqual(len(launches), 1)
         _, user, ref, req = launches[0]
@@ -1103,6 +1111,7 @@ class TestChatTasks(Base):
         self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
         t = self.state().get("t1")
         self.assertEqual((t["user"], t["thread"], t["session_uuid"], t["run_status"]), ("asha", T1, req["session_uuid"], "running"))
+        self.assertEqual(t["threads"], [["task", "spaces/DM1/threads/U1"]])     # the message's own thread is kept too
         rows = [r for r in self.audit_rows() if r["event"] == "chat_task"]
         self.assertEqual([(r["task"], r["chars"], r["phase"]) for r in rows], [("t1", 17, "started")])
 
@@ -1114,14 +1123,14 @@ class TestChatTasks(Base):
         self.assertEqual(second[1:3], ("asha", "t1"))
         self.assertEqual((second[3]["mode"], second[3]["prompt"], second[3]["resume"]), ("task", "also add a test", True))
         self.assertEqual(second[3]["session_uuid"], first[3]["session_uuid"])
-        self.assertEqual(self.chat.sent[-1][2], T1)                          # acknowledged in the same thread
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", ON_IT))          # acknowledged at the top level
         self.assertEqual(self.state().get("t1")["run_status"], "running")
-        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("On it (task")]), 1)   # not a new task
+        self.assertEqual(len(self.state().tasks("asha")), 1)                 # not a new task
 
     def test_reply_while_running_is_turned_away(self):
         self.b.handle_event(classic("fix the login bug"))
         self.b.handle_event(classic("and the signup bug", thread=T1))
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", STILL_LAST_MESSAGE, T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", STILL_LAST_MESSAGE))
         self.assertEqual(len(self.host.launches()), 1)
 
     def test_a_yes_in_a_task_thread_goes_to_the_task(self):
@@ -1136,8 +1145,8 @@ class TestChatTasks(Base):
         long_text = "word " * 600                                             # 3000 characters
         self.result("t1", long_text.strip())
         self.b.check_outbox()
-        space, text, thread = self.chat.sent[-1]
-        self.assertEqual((space, thread), ("spaces/DM1", T1))
+        space, text = self.chat.sent[-1]
+        self.assertEqual(space, "spaces/DM1")
         self.assertTrue(text.startswith("word word"))
         self.assertIn("full result: ask your agent to show ~/.claude/chat-results/t1.txt", text)
         self.assertLess(len(text), 1500 + 200)
@@ -1147,7 +1156,7 @@ class TestChatTasks(Base):
         self.assertEqual([r["phase"] for r in rows], ["started", "done"])
         self.b.handle_event(classic("and a summary", thread=T1))
         self.result("t1", "short answer"); self.b.check_outbox()            # a short one goes as it is
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "short answer", T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "short answer"))
 
     def test_needs_you_and_failed_results_say_so(self):
         self.b.handle_event(classic("deploy it"))
@@ -1188,7 +1197,7 @@ class TestChatTasks(Base):
         n = len(self.chat.sent)
         self.b.handle_event(classic("  ", thread=T1)); self.assertEqual(len(self.chat.sent), n)
         self.b.handle_event(classic("b" * 4001, thread=T1))
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That's too long for one message (4000 characters max).", T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That's too long for one message (4000 characters max)."))
         self.assertEqual(len(self.host.launches()), 1)
 
     def test_inactive_person_gets_sign_in_replies_not_a_task(self):
@@ -1209,7 +1218,7 @@ class TestChatTasks(Base):
         b2 = cb.Bridge(self.cfg, cb.PeopleStore(self.people), chat2, self.host, now=lambda: self.clock[0])
         self.result("t1", "Fixed in PR 12.")
         b2.check_outbox()
-        self.assertEqual(chat2.sent, [("spaces/DM1", "Fixed in PR 12.", T1)])
+        self.assertEqual(chat2.sent, [("spaces/DM1", "Fixed in PR 12.")])
         b2.handle_event(classic("thanks, also the docs", thread=T1))
         self.assertEqual(self.host.launches()[-1][3]["resume"], True)
 
@@ -1225,7 +1234,7 @@ class TestChatTasks(Base):
             self.assertNotIn(GH_TOKEN, where)
         self.b.handle_event(classic("fix it")); self.result("t1", "ok"); self.b.check_outbox()
         self.b.handle_event(classic("here: " + GH_TOKEN, thread=T1))        # a follow-up is checked too
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That looks like a secret, so I did not send it.", T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "That looks like a secret, so I did not send it."))
         self.assertEqual(len(self.host.launches()), 1)
 
     def test_a_litellm_key_in_a_sentence_is_refused_and_starts_no_task(self):
@@ -1249,13 +1258,13 @@ class TestChatTasks(Base):
 
     def test_daily_cap_and_box_wide_slots(self):
         self.b.handle_event(classic("task one"))
-        self.b.handle_event(classic("task two"))
-        self.assertEqual(self.chat.last(), "Still working on your last task (#1).")
+        self.b.handle_event(classic("new: task two"))
+        self.assertEqual(self.chat.last(), STILL_LAST_MESSAGE)
         self.assertEqual(len(self.host.launches()), 1)
         self.b.cfg.chat_tasks_per_day = 2
         self.result("t1", "ok"); self.b.check_outbox()
-        self.b.handle_event(classic("task two")); self.result("t2", "ok"); self.b.check_outbox()
-        self.b.handle_event(classic("task three"))
+        self.b.handle_event(classic("new: task two")); self.result("t2", "ok"); self.b.check_outbox()
+        self.b.handle_event(classic("new: task three"))
         self.assertEqual(self.chat.last(), "You've used today's 2 Chat tasks.")
         self.assertEqual(len(self.host.launches()), 2)
         # box-wide: two runs at once, a third person's task waits for a slot
@@ -1275,7 +1284,8 @@ class TestChatTasks(Base):
         self.assertEqual([c[1] for c in self.host.launches()], ["asha", "ravi"])
         mira = self.state().tasks("mira")[0]
         self.assertEqual(mira["run_status"], "queued")
-        self.assertIn(("spaces/DM3", ON_IT % mira["ref"][1:] + " It starts when a slot is free.", "spaces/DM3/threads/T%d" % self.chat.threads), self.chat.sent)
+        self.assertIn(("spaces/DM3", ON_IT + " It starts when a slot is free."), self.chat.sent)
+        self.assertEqual(mira["thread"], "spaces/DM3/threads/T%d" % self.chat.threads)
         self.b.handle_event(classic("mira again", email="mira@co.test", space="spaces/DM3", thread=mira["thread"]))
         self.assertEqual(self.chat.sent[-1][1], STILL_LAST_MESSAGE)       # queued counts as working
         self.b.check_outbox()
@@ -1297,12 +1307,12 @@ class TestChatTasks(Base):
         self.b.handle_event(classic("and one more thing", thread=T1))        # run 2 of 2
         self.assertEqual(len(self.host.launches()), 2)
         self.b.handle_event(classic("and again", thread=T1))                 # turned away while running: not counted
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", STILL_LAST_MESSAGE, T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", STILL_LAST_MESSAGE))
         self.result("t1", "ok"); self.b.check_outbox()
         self.b.handle_event(classic("and a third", thread=T1))
-        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "You've used today's 2 Chat tasks.", T1))
+        self.assertEqual(self.chat.sent[-1], ("spaces/DM1", "You've used today's 2 Chat tasks."))
         self.assertEqual(len(self.host.launches()), 2)
-        self.b.handle_event(classic("a new task"))
+        self.b.handle_event(classic("new: a new task"))
         self.assertEqual(self.chat.last(), "You've used today's 2 Chat tasks.")
         self.assertEqual(len(self.host.launches()), 2)
         self.clock[0] += 86400                                               # a new day
@@ -1403,7 +1413,7 @@ class TestChatTasks(Base):
     def test_a_run_that_cannot_start_or_never_reports_frees_its_slot(self):
         self.host.launch_ok = False
         self.b.handle_event(classic("fix the login bug"))
-        self.assertIn("couldn't start", self.chat.sent[-1][1]); self.assertEqual(self.chat.sent[-1][2], T1)
+        self.assertIn("couldn't start", self.chat.sent[-1][1]); self.assertEqual(len(self.chat.sent[-1]), 2)
         self.assertEqual(self.state().get("t1")["run_status"], "idle")
         self.host.launch_ok = True
         self.b.handle_event(classic("again", thread=T1))
@@ -1418,7 +1428,7 @@ class TestChatTasks(Base):
         self.clock[0] += 13 * 60                                              # past RuntimeMaxSec and some: it died
         self.b.check_outbox()
         self.assertEqual(self.state().get("t1")["run_status"], "idle")
-        self.assertIn("stopped without an answer", self.chat.sent[-1][1]); self.assertEqual(self.chat.sent[-1][2], T1)
+        self.assertIn("stopped without an answer", self.chat.sent[-1][1]); self.assertEqual(len(self.chat.sent[-1]), 2)
         self.assertEqual([r["phase"] for r in self.audit_rows() if r["event"] == "chat_task"][-1], "failed")
 
     def test_doorbell_messages_still_go_through_beside_results(self):
@@ -1427,22 +1437,21 @@ class TestChatTasks(Base):
                                     {"kind": "result", "ref": "t1", "status": "ok", "text": "fixed", "ts": None}]
         self.b.check_outbox()
         self.assertIn(("spaces/DM1", "[agent] PR ready"), self.chat.sent)
-        self.assertIn(("spaces/DM1", "fixed", T1), self.chat.sent)
+        self.assertIn(("spaces/DM1", "fixed"), self.chat.sent)
 
 
 A1, A2, A3 = "a0000000001", "a0000000002", "a0000000003"
 D1 = "d0000000001"
 Q = "what is the retry limit on the upload endpoint?"
-ASK_OK = "Your agent wants to ask %s: «%s». Reply yes in this thread to send it, or no."
-ASK_TO_PERSON = "%s's agent asks: «%s». Reply in this thread to answer, or say do it to have your agent do it."
-ASK_COPY = "Your agent answered %s's agent. Q: %s A: %s"
-ASK_DM = "%s answered your agent's question «%s»: %s"
+ASK_OK = 'Ask %s "%s" \u2014 yes / no'
+ASK_TO_PERSON = '%s asks: "%s" \u2014 just reply, or say "do it" to let your agent handle it.'
+ASK_COPY = 'Your agent answered %s ("%s"): %s Reply to correct it.'   # the answer brings its own full stop
+ASK_DM = "%s: %s"
 DM1, DM2, DM3 = "spaces/DM1", "spaces/DM2", "spaces/DM3"
 
 
-class TestAsks(Base):
-    """An agent asks a colleague: its own person approves in Chat, the colleague's agent tries a read-only answer,
-    else the colleague answers or says "do it"; the answer lands in the asker's inbox, or their DM if unread."""
+class AskBase(Base):
+    """Helpers for an agent asking a colleague (no tests of its own)."""
     def setUp(self):
         super().setUp()
         self.activate("asha")
@@ -1514,10 +1523,22 @@ class TestAsks(Base):
         self.addCleanup(lg.removeHandler, h)
         return records
 
+    def chat_task(self, who="asha"):
+        """A finished Chat task of `who`; returns (ref, thread)."""
+        self.say("look into the upload limit", who=who)
+        t = [x for x in self.state().tasks(who)][-1]
+        self.result(t["ref"], "looked", "ok", user=who)
+        return t["ref"], t["thread"]
+
+
+class TestAsks(AskBase):
+    """An agent asks a colleague: its own person approves in Chat, the colleague's agent tries a read-only answer,
+    else the colleague answers or says "do it"; the answer lands in the asker's inbox, or their DM if unread."""
+
     # ---- the flow
     def test_ask_asks_the_asker_for_ok_in_its_own_thread(self):
         self.ask()
-        self.assertEqual(self.chat.sent, [(DM1, ASK_OK % ("Ravi", Q), DM1 + "/threads/T1")])
+        self.assertEqual(self.chat.sent, [(DM1, ASK_OK % ("Ravi", Q))])     # at the top level, its own thread T1
         a = self.state().get(A1)
         self.assertEqual((a["from"], a["to"], a["status"], a["approval_thread"]), ("asha", "ravi", "awaiting_ok", DM1 + "/threads/T1"))
         self.assertEqual(self.host.launches(), [])
@@ -1532,9 +1553,7 @@ class TestAsks(Base):
         self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
         a = self.state().get(A1)
         self.assertEqual((a["status"], a["run_status"]), ("asking_agent", "running"))
-        space, text, thread = self.chat.sent[-1]
-        self.assertEqual((space, thread), (DM1, self.approval_thread()))
-        self.assertIn("Ravi", text)
+        self.assertEqual(self.chat.sent[-1], (DM1, "Sent to Ravi."))
         self.assertEqual(self.sent_to(DM2), [])                              # Ravi hears nothing unless needed
         # no free slot: the answer run waits, then starts with the outbox check
         self.cfg.chat_runs_at_once = 1
@@ -1551,7 +1570,7 @@ class TestAsks(Base):
                                         "text": "Asha did not approve this question."})
         self.assertEqual(self.state().get(A1)["status"], "declined")
         self.assertEqual(self.host.launches(), []); self.assertEqual(self.sent_to(DM2), [])
-        self.assertEqual(self.chat.sent[-1][2], self.approval_thread())
+        self.assertEqual(self.chat.sent[-1], (DM1, "Not sent."))
         self.ask(ask=A2)
         self.clock[0] += 7200 - 1
         self.b.check_asks()                                                   # settles A1 (unread: cleaned up)
@@ -1567,16 +1586,18 @@ class TestAsks(Base):
         self.assertEqual(self.host.launches(), [])
         self.assertEqual(self.sent_to(DM2), [])
 
-    def test_yes_in_a_task_thread_or_at_top_level_never_approves(self):
-        self.say("fix the login bug")                                         # task t1 in thread T1
+    def test_yes_in_a_task_thread_never_approves_and_a_colleagues_yes_never_does(self):
+        # plain chat: a top-level yes now approves the one waiting approval (TestPlainChat); a yes inside the task's
+        # thread still goes to the task, and nobody else's yes approves
+        self.say("fix the login bug")                                         # task t1, its "On it." in thread T1
         self.result("t1", "fixed", "ok", user="asha")
-        self.ask()                                                            # approval in thread T2
-        self.assertEqual(self.approval_thread(), DM1 + "/threads/T2")
+        self.ask()
+        self.assertEqual(self.approval_thread(), DM1 + "/threads/T%d" % self.chat.threads)
         self.say("yes", thread=DM1 + "/threads/T1")                           # answers the task
         self.assertEqual([(c[1], c[2], c[3]["prompt"]) for c in self.host.launches()][-1], ("asha", "t1", "yes"))
-        self.say("yes")                                                       # top level: the restart "yes"
-        self.assertIn("Nothing is waiting", self.chat.sent[-1][1])
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
         self.say("yes", who="ravi")
+        self.assertIn("Nothing is waiting", self.chat.sent[-1][1])
         self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
         self.assertFalse([c for c in self.host.launches() if c[1] == "ravi"])
 
@@ -1585,7 +1606,7 @@ class TestAsks(Base):
         self.result(A1, "The limit is 3.", "answer")
         self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "agent", "from": "ravi",
                                         "text": "The limit is 3."})
-        self.assertEqual(self.sent_to(DM2), [(DM2, ASK_COPY % ("Asha", Q, "The limit is 3."), DM2 + "/threads/T2")])
+        self.assertEqual(self.sent_to(DM2), [(DM2, ASK_COPY % ("Asha", Q, "The limit is 3."))])
         a = self.state().get(A1)
         self.assertEqual((a["status"], a["run_status"]), ("answered", "idle"))
         self.host.inbox.pop(("asha", A1))                                     # the waiter read it
@@ -1602,17 +1623,17 @@ class TestAsks(Base):
         # M2: a reply under "Your agent answered ..." is Ravi's own answer to Asha, never a new task for Ravi
         self.ask(); self.approve()
         self.result(A1, "The limit is 3.", "answer")
-        copy = DM2 + "/threads/T2"
-        self.assertEqual(self.state().get(A1)["copy_thread"], copy)
+        copy = self.state().get(A1)["copy_thread"]
+        self.assertEqual(copy, DM2 + "/threads/T%d" % self.chat.threads)    # the copy is the newest post
         self.say("Actually it is 5 since PR 9", thread=copy, who="ravi")
         body = self.inbox()
         self.assertEqual((body["outcome"], body["by"], body["from"]), ("answered", "person", "ravi"))
         self.assertIn("Actually it is 5 since PR 9", body["text"]); self.assertIn("correct", body["text"].lower())
-        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha as a correction.", copy))
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha as a correction."))
         self.assertEqual([c for c in self.host.launches() if c[1] == "ravi" and c[2].startswith("t")], [])
         self.assertEqual(self.state().tasks("ravi"), [])
         self.say("here: " + GH_TOKEN, thread=copy, who="ravi")               # checked like any answer
-        self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it.", copy))
+        self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it."))
         self.assertNotIn(GH_TOKEN, json.dumps(self.inbox()))
         self.say("x" * 4001, thread=copy, who="ravi")
         self.assertIn("too long", self.chat.sent[-1][1])
@@ -1627,7 +1648,7 @@ class TestAsks(Base):
         n = len(self.host.inbox_writes)
         self.say("one more fix", thread=copy, who="ravi")                     # closed: already delivered
         self.assertEqual(self.chat.sent[-1], (DM2, "That answer was already delivered to Asha's agent, so this was "
-                                                    "not sent.", copy))
+                                                    "not sent."))
         self.assertEqual(len(self.host.inbox_writes), n)
         self.assertEqual(self.state().tasks("ravi"), [])
 
@@ -1667,7 +1688,7 @@ class TestAsks(Base):
     def test_cannot_answer_opens_a_thread_for_the_colleague(self):
         thread = self.to_person()
         self.assertEqual(self.sent_to(DM2), [(DM2, ASK_TO_PERSON % ("Asha", Q)
-                                              + " (Your agent could not answer: needs a decision from ravi)", thread)])
+                                              + " (Your agent could not answer: needs a decision from ravi)")])
         a = self.state().get(A1)
         self.assertEqual((a["status"], a["run_status"]), ("with_person", "idle"))
         self.assertIsNone(self.inbox())
@@ -1694,8 +1715,7 @@ class TestAsks(Base):
         self.say("It is 3, see upload/config.py", thread=thread, who="ravi")
         self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "person", "from": "ravi",
                                         "text": "It is 3, see upload/config.py"})
-        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
-        self.assertIn("Asha", self.chat.sent[-1][1])
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
         self.assertEqual(self.state().get(A1)["status"], "answered")
         self.assertEqual([c for c in self.host.launches() if c[2].startswith("t")], [])   # not a task for Ravi
 
@@ -1707,12 +1727,12 @@ class TestAsks(Base):
         self.assertEqual((req["mode"], req["resume"], req["ask"], req["asker"]), ("doit", False, A1, "asha"))
         self.assertIn(Q, req["prompt"]); self.assertIn("QUESTION", req["prompt"])
         self.assertRegex(req["session_uuid"], cb.CONVERSATION_RE.pattern)
-        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertEqual(self.chat.sent[-1], (DM2, "On it."))
         self.assertEqual(self.state().get(A1)["run_status"], "running")
         self.result(D1, "Raised it to 5 in PR 9.", "ok")
         self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "agent", "from": "ravi",
                                         "text": "Raised it to 5 in PR 9."})
-        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertEqual(self.chat.sent[-1][0], DM2)
         self.assertIn("Raised it to 5 in PR 9.", self.chat.sent[-1][1])
         self.assertEqual(self.state().get(A1)["run_status"], "idle")
 
@@ -1721,7 +1741,7 @@ class TestAsks(Base):
         self.say("do it", thread=thread, who="ravi")
         self.result(D1, "Built it.\nNEEDS YOU: approve the deploy", "needs_you")
         self.assertIsNone(self.inbox())
-        self.assertEqual(self.chat.sent[-1][0::2], (DM2, thread))
+        self.assertEqual(self.chat.sent[-1][0], DM2)
         self.assertIn("approve the deploy", self.chat.sent[-1][1]); self.assertIn("needs you", self.chat.sent[-1][1].lower())
         self.assertEqual(self.state().get(A1)["status"], "with_person")
         self.say("do it", thread=thread, who="ravi")                         # again, a fresh run
@@ -1751,11 +1771,10 @@ class TestAsks(Base):
         self.add_person("mira", "mira", DM3)
         self.say("It is 7", thread=thread, who="mira")                        # another person, same thread name
         self.say("It is 8", thread=thread, who="asha")                        # the asker herself
-        self.say("It is 9", who="ravi")                                       # Ravi, but not in that thread
-        self.say("It is 10", thread=DM2 + "/threads/T99", who="ravi")         # Ravi, another thread
         self.say("It is 11", thread=thread, who="ravi", space="spaces/DM9")   # Ravi's thread name from another space
         self.assertIsNone(self.inbox())
         self.assertEqual(self.state().get(A1)["status"], "with_person")
+        # (plain chat: Ravi's own message at the top level, or in another thread, is now the answer: TestPlainChat)
         # and the approval thread is Asha's alone
         self.ask(ask=A2)
         self.say("yes", thread=self.approval_thread(A2), who="ravi")
@@ -1789,7 +1808,7 @@ class TestAsks(Base):
         self.assertEqual(self.b.check_asks(), 1)
         self.assertIsNone(self.inbox())
         self.assertIn(("remove_inbox", "asha", A1), self.host.calls)
-        self.assertEqual(self.chat.sent[-1], (DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")))
+        self.assertEqual(self.chat.sent[-1], (DM1, ASK_DM % ("Ravi's agent", "The limit is 3.")))
         self.assertIsNotNone(self.state().get(A1)["closed_at"])
         n = len(self.chat.sent)
         self.clock[0] += 600
@@ -1799,7 +1818,7 @@ class TestAsks(Base):
         self.host.inbox_fail = True
         thread = self.to_person(ask=A2)
         self.say("It is 3.", thread=thread, who="ravi")
-        self.assertEqual(self.chat.sent[-2], (DM1, ASK_DM % ("Ravi", Q, "It is 3.")))
+        self.assertEqual(self.chat.sent[-2], (DM1, ASK_DM % ("Ravi", "It is 3.")))
         self.assertIsNotNone(self.state().get(A2)["closed_at"])
         # a declined or expired question left unread is only cleaned up, never DMed
         self.host.inbox_fail = False
@@ -1812,9 +1831,9 @@ class TestAsks(Base):
 
     def test_self_unknown_and_inactive_names_are_refused(self):
         self.add_person("mira", "mlinux", DM3)                               # a name that is not the Linux user
-        cases = [("asha", A1, "asha", "yourself"), ("nobody", A2, "asha", "no colleague called nobody"),
-                 ("self", A3, "asha", "no colleague called self"), ("root", "a0000000004", "asha", "no colleague called root"),
-                 ("mlinux", "a0000000005", "asha", "no colleague called mlinux"),
+        cases = [("asha", A1, "asha", "yourself"), ("nobody", A2, "asha", 'no colleague called "nobody"'),
+                 ("self", A3, "asha", 'no colleague called "self"'), ("root", "a0000000004", "asha", 'no colleague called "root"'),
+                 ("mlinux", "a0000000005", "asha", 'no colleague called "mlinux"'),
                  ("mira", "a0000000006", "mlinux", "yourself")]
         for to, ask, user, why in cases:
             self.ask(to=to, ask=ask, user=user)
@@ -1866,7 +1885,7 @@ class TestAsks(Base):
             self.assertEqual(self.state().get(A2)["status"], "with_person")
             thread = self.received_thread(A2)
             self.say("here: " + GH_TOKEN, thread=thread, who="ravi")           # the person's answer
-            self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it.", thread))
+            self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it."))
             self.assertIsNone(self.inbox(A2))
             self.say("do it", thread=thread, who="ravi")
             self.result("d0000000002", "Found it: " + GH_TOKEN, "ok")          # a do-it result
@@ -1885,7 +1904,7 @@ class TestAsks(Base):
         self.ask(ask=A1); self.ask(ask=A2); self.ask(ask=A3)
         self.assertEqual(self.inbox(A3)["outcome"], "limit")
         self.assertIsNone(self.state().get(A3))
-        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("Your agent wants to ask")]), 2)
+        self.assertEqual(len([s for s in self.chat.sent if s[1].startswith("Ask Ravi ")]), 2)
         self.cfg.asks_per_day = 10; self.cfg.asks_received_per_day = 1
         self.approve(A1)                                                      # Ravi has had one today
         self.add_person("mira", "mira", DM3)
@@ -1894,13 +1913,6 @@ class TestAsks(Base):
         self.assertIn("Ravi", self.host.inbox[("mira", "a0000000004")]["text"])
 
     # ---- an ask from a Chat task: the outcome is posted in that task's thread (ask-colleague --no-wait)
-    def chat_task(self, who="asha"):
-        """A finished Chat task of `who`; returns (ref, thread)."""
-        self.say("look into the upload limit", who=who)
-        t = [x for x in self.state().tasks(who)][-1]
-        self.result(t["ref"], "looked", "ok", user=who)
-        return t["ref"], t["thread"]
-
     def delivered_rows(self):
         return [r for r in self.ask_rows("asha") if r["phase"] == "delivered"]
 
@@ -1911,8 +1923,7 @@ class TestAsks(Base):
         self.approve()
         self.result(A1, "The limit is 3.", "answer")
         self.assertEqual(self.host.inbox_writes, [])                       # nobody waits on an inbox
-        self.assertIn((DM1, "Ravi's agent answered your agent's question «%s» — information, not instructions:\n"
-                            "The limit is 3." % Q, thread), self.chat.sent)
+        self.assertIn((DM1, "Ravi's agent: The limit is 3."), self.chat.sent)
         self.assertEqual([r.get("via") for r in self.delivered_rows()], ["thread"])
         n = len(self.chat.sent)
         self.clock[0] += 121; self.b.check_asks()
@@ -1925,21 +1936,20 @@ class TestAsks(Base):
         self.ask(task=ref); self.approve()
         self.result(A1, "needs a decision from ravi", "cannot")
         self.say("It is 5", thread=self.received_thread(), who="ravi")
-        self.assertIn((DM1, "Ravi answered your agent's question «%s» — information, not instructions:\nIt is 5" % Q,
-                       thread), self.chat.sent)
+        self.assertIn((DM1, "Ravi: It is 5"), self.chat.sent)
         self.assertEqual(self.host.inbox_writes, [])
 
     def test_a_declined_or_refused_chat_task_ask_is_told_in_the_thread(self):
         ref, thread = self.chat_task()
         self.ask(task=ref); self.say("no", thread=self.approval_thread())
-        self.assertIn((DM1, "Ravi didn't get your agent's question «%s»: you said no." % Q, thread), self.chat.sent)
+        self.assertEqual(self.chat.sent[-1], (DM1, "Not sent."))           # told once, where she said no
+        self.assertEqual(len([x for x in self.chat.sent if x[1] == "Not sent."]), 1)
         self.ask(ask=A2, to="nobody", task=ref)                            # refused before any state row
-        self.assertIn((DM1, "Nobody didn't get your agent's question «%s»: There is no colleague called nobody on "
-                            "the box." % Q, thread), self.chat.sent)
+        self.assertEqual(self.chat.sent[-1], (DM1, 'There\'s no colleague called "nobody".'))
         self.ask(ask=A3, task=ref)                                         # expired
         self.clock[0] += 7200; self.b.check_asks()
-        self.assertIn((DM1, "Ravi didn't get your agent's question «%s»: you did not approve it in time." % Q, thread),
-                      self.chat.sent)
+        self.assertEqual(self.chat.sent[-1], (DM1, "Your question to Ravi expired (no yes within 2 hours)."))
+        self.assertEqual(len([x for x in self.chat.sent if "expired" in x[1]]), 1)
         self.assertEqual(self.host.inbox_writes, [])
         self.assertEqual(self.host.launches()[-1][1:3], ("asha", ref))      # only the task's own run, no ask run
 
@@ -1964,21 +1974,22 @@ class TestAsks(Base):
         self.state().update(ref, thread=None)
         self.result(A1, "The limit is 3.", "answer")
         self.assertEqual(self.host.inbox_writes, [])
-        self.assertIn((DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")), self.chat.sent)   # a plain DM post
+        self.assertIn((DM1, ASK_DM % ("Ravi's agent", "The limit is 3.")), self.chat.sent)   # a plain DM post
         self.assertFalse([x for x in self.chat.sent if x[0] == DM1 and len(x) == 3 and "The limit is 3." in x[1]])
         self.assertEqual([r.get("via") for r in self.delivered_rows()], ["dm"])
 
     def test_a_failed_thread_post_falls_back_to_the_dm(self):
         ref, thread = self.chat_task()
         self.ask(task=ref); self.approve()
-        real = self.chat.send
+        real, failed = self.chat.send, []
         def send(space, text, thread=None, new_thread=False):
-            if thread and thread == self.state().get(ref)["thread"]:
+            if "The limit is 3." in text and not failed:                      # the first try, as part of the task
+                failed.append(text)
                 raise RuntimeError("chat down")
             return real(space, text, thread=thread, new_thread=new_thread)
         self.chat.send = send
         self.result(A1, "The limit is 3.", "answer")
-        self.assertIn((DM1, ASK_DM % ("Ravi's agent", Q, "The limit is 3.")), self.chat.sent)
+        self.assertIn((DM1, ASK_DM % ("Ravi's agent", "The limit is 3.")), self.chat.sent)
         self.assertEqual(self.host.inbox_writes, [])
         self.assertEqual([r.get("via") for r in self.delivered_rows()], ["dm"])
 
@@ -2012,6 +2023,281 @@ class TestAsks(Base):
             for where in [self.file_text(os.path.join(self.audit, u + ".jsonl")) for u in ("asha", "ravi", "mlinux")] + \
                     [r.getMessage() for r in records]:
                 self.assertNotIn(t, where)
+
+
+class TestPlainChat(AskBase):
+    """Plain chat: the bot posts at the top level of the DM, and a plain message answers whatever is waiting for the
+    person (an approval, a colleague's question, the restart question, their recent task), asking back only when
+    that is unclear."""
+
+    def handed(self, ask=A1, frm="asha", text=Q):
+        """An approved question from `frm` that Ravi's agent could not answer: it now waits on Ravi."""
+        self.ask(text, ask=ask, user=frm); self.say("yes", who=frm)
+        self.result(ask, "needs a decision from ravi", "cannot")
+        self.assertEqual(self.state().get(ask)["status"], "with_person")
+
+    def last_thread(self, space):
+        """The thread FakeChat gave the newest post."""
+        return "%s/threads/T%d" % (space, self.chat.threads)
+
+    def bridge(self):
+        """A fresh bridge on the same files: a restart, with no memory of handled messages."""
+        return cb.Bridge(self.cfg, cb.PeopleStore(self.people), self.chat, self.host, now=lambda: self.clock[0])
+
+    def test_a_top_level_yes_approves_the_one_waiting_approval_and_no_declines(self):
+        self.ask()
+        self.assertEqual(self.chat.sent, [(DM1, 'Ask Ravi "%s" — yes / no' % Q)])
+        self.say("yes")                                                       # the screenshot bug: no thread needed
+        self.assertEqual([(c[1], c[2]) for c in self.host.launches()], [("ravi", A1)])
+        self.assertEqual(self.state().get(A1)["status"], "asking_agent")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Sent to Ravi."))
+        self.ask(ask=A2); self.say("No")
+        self.assertEqual(self.state().get(A2)["status"], "declined")
+        self.assertEqual(self.inbox(A2)["outcome"], "declined")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Not sent."))
+        self.assertEqual(len(self.host.launches()), 1)
+
+    def test_a_plain_message_is_the_answer_to_the_one_question_waiting(self):
+        self.handed()
+        self.assertEqual(self.sent_to(DM2)[-1], (DM2, ASK_TO_PERSON % ("Asha", Q)
+                                                 + " (Your agent could not answer: needs a decision from ravi)"))
+        self.say("It is 3, see upload/config.py", who="ravi")
+        self.assertEqual(self.inbox(), {"ask": A1, "outcome": "answered", "by": "person", "from": "ravi",
+                                        "text": "It is 3, see upload/config.py"})
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
+        self.assertEqual(self.state().tasks("ravi"), [])                      # not a task for Ravi
+
+    def test_the_asker_reads_name_colon_answer(self):
+        ref, _ = self.chat_task()
+        self.ask(task=ref); self.say("yes")
+        self.result(A1, "needs a decision from ravi", "cannot")
+        self.say("It is 5", who="ravi")
+        self.assertEqual(self.sent_to(DM1)[-1], (DM1, "Ravi: It is 5"))
+
+    def test_do_it_with_one_question_waiting_starts_the_do_it_run(self):
+        ref, _ = self.chat_task()
+        self.ask(task=ref); self.say("yes"); self.result(A1, "not sure", "cannot")
+        self.say("do it", who="ravi")
+        _, user, r, req = self.host.launches()[-1]
+        self.assertEqual((user, r, req["mode"], req["ask"]), ("ravi", D1, "doit", A1))
+        self.assertEqual(self.chat.sent[-1], (DM2, "On it."))
+        self.result(D1, "Raised it to 5 in PR 9.", "ok")
+        self.assertIn((DM1, "Ravi's agent: Raised it to 5 in PR 9."), self.chat.sent)
+
+    def test_a_plain_message_continues_a_recent_task_and_new_starts_one(self):
+        self.say("fix the login bug")
+        self.assertEqual(self.chat.sent[-1], (DM1, ON_IT))
+        self.result("t1", "Fixed in PR 12.", "ok", user="asha")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Fixed in PR 12."))          # as it is: no "Task #1"
+        self.clock[0] += 119 * 60
+        self.say("also add a test")
+        first, second = self.host.launches()
+        self.assertEqual((second[2], second[3]["prompt"], second[3]["resume"]), ("t1", "also add a test", True))
+        self.assertEqual(second[3]["session_uuid"], first[3]["session_uuid"])
+        self.assertEqual(self.chat.sent[-1], (DM1, ON_IT))
+        self.say("and the docs")                                              # it is running
+        self.assertEqual(self.chat.sent[-1], (DM1, STILL_LAST_MESSAGE))
+        self.assertEqual(len(self.host.launches()), 2)
+        self.result("t1", "Added.", "ok", user="asha")
+        self.say("New: write release notes")                                  # always a new task
+        last = self.host.launches()[-1]
+        self.assertEqual((last[2], last[3]["prompt"], last[3]["resume"]), ("t2", "write release notes", False))
+        self.assertNotEqual(last[3]["session_uuid"], first[3]["session_uuid"])
+        self.result("t2", "Done.", "ok", user="asha")
+        self.clock[0] += 2 * 3600                                             # two hours later: a new task
+        self.say("one more thing")
+        self.assertEqual(self.host.launches()[-1][2:4][0], "t3")
+        self.assertEqual(self.host.launches()[-1][3]["resume"], False)
+
+    def test_two_candidates_ask_back_and_a_number_routes_the_original(self):
+        self.chat_task(who="ravi"); self.handed()
+        n = len(self.host.launches())
+        self.say("It is 3", who="ravi")
+        self.assertEqual(self.chat.sent[-1], (DM2, 'Which one is this for?\n1. Asha\'s question: "%s"\n'
+                                                   '2. Your last task: "look into the upload limit"\n3. A new task\n'
+                                                   'Reply with the number or the name.' % Q))
+        self.assertIsNone(self.inbox()); self.assertEqual(len(self.host.launches()), n)
+        self.say("1", who="ravi")
+        self.assertEqual(self.inbox()["text"], "It is 3")
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
+        self.assertEqual(len(self.host.launches()), n)
+        self.say("2", who="ravi")                                             # answered: "2" is a fresh message
+        self.assertEqual(self.host.launches()[-1][3]["prompt"], "2")          # ... which continues his task
+
+    def test_a_name_or_new_picks_from_the_list(self):
+        self.chat_task(who="ravi"); self.handed()
+        self.say("It is 3", who="ravi"); self.say("asha", who="ravi")
+        self.assertEqual(self.inbox()["text"], "It is 3")
+        self.handed(ask=A2)
+        self.say("check the logs", who="ravi"); self.say("new", who="ravi")
+        last = self.host.launches()[-1]
+        self.assertEqual((last[1], last[3]["prompt"], last[3]["resume"]), ("ravi", "check the logs", False))
+        self.assertEqual(len(self.state().tasks("ravi")), 2)
+        self.assertEqual(self.state().get(A2)["status"], "with_person")
+        self.assertIsNone(self.inbox(A2))
+
+    def test_any_other_reply_drops_the_clarification_and_an_old_one_is_ignored(self):
+        self.chat_task(who="ravi"); self.handed()
+        self.say("It is 3", who="ravi")
+        self.say("It is 4", who="ravi")                                       # not a pick: handled fresh, asked again
+        self.assertTrue(self.chat.sent[-1][1].startswith("Which one is this for?"))
+        self.say("1", who="ravi")
+        self.assertEqual(self.inbox()["text"], "It is 4")
+        self.handed(ask=A2)
+        self.say("It is 5", who="ravi")
+        self.clock[0] += 601                                                   # over 10 minutes: "1" is fresh
+        self.say("1", who="ravi")
+        self.assertIsNone(self.inbox(A2))
+        self.assertTrue(self.chat.sent[-1][1].startswith("Which one is this for?"))
+        self.say("status", who="ravi")                                        # a command drops it too
+        self.say("1", who="ravi")
+        self.assertIsNone(self.inbox(A2))
+
+    def test_a_name_that_fits_two_items_never_picks_one(self):
+        self.chat_task(who="ravi"); self.handed(); self.handed(ask=A2)
+        self.say("It is 3", who="ravi")
+        self.assertIn("2. Asha's question", self.chat.sent[-1][1])
+        self.say("Asha", who="ravi")                                          # both are Asha's: asked again
+        self.assertIsNone(self.inbox(A1)); self.assertIsNone(self.inbox(A2))
+        self.assertTrue(self.chat.sent[-1][1].startswith("Which one is this for?"))
+
+    def test_naming_a_person_picks_their_item_without_asking_back(self):
+        self.add_person("mira", "mira", DM3)
+        self.handed()
+        self.handed(ask=A2, frm="mira")
+        self.say("for Mira: it ships friday", who="ravi")
+        self.assertEqual(self.host.inbox[("mira", A2)]["text"], "for Mira: it ships friday")
+        self.assertIsNone(self.inbox(A1))
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Mira."))
+
+    def test_yes_or_no_with_nothing_waiting(self):
+        for w in ("yes", "Y", "no", " n "):
+            self.say(w)
+            self.assertEqual(self.chat.sent[-1], (DM1, NOTHING_WAITING))
+        self.assertEqual(self.host.launches(), []); self.assertEqual(self.state().tasks("asha"), [])
+
+    def test_a_reply_inside_an_items_thread_still_routes_to_it(self):
+        self.say("delete the stale branch?")
+        on_it = self.state().get("t1")["thread"]
+        self.result("t1", "Shall I?\nNEEDS YOU: say yes", "needs_you", user="asha")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Shall I?\nNEEDS YOU: say yes"))   # as it is, no header
+        result_thread = self.last_thread(DM1)
+        self.ask()                                                            # an approval waits as well
+        self.say("yes", thread=result_thread)                                 # inside the result's thread: the task
+        self.assertEqual((self.host.launches()[-1][2], self.host.launches()[-1][3]["prompt"]), ("t1", "yes"))
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.result("t1", "Deleted.", "ok", user="asha")
+        self.say("and the other one", thread=on_it)                           # the first post's thread too
+        self.assertEqual((self.host.launches()[-1][2], self.host.launches()[-1][3]["prompt"]),
+                         ("t1", "and the other one"))
+        self.say("yes", thread=self.approval_thread())                        # the approval's own thread
+        self.assertEqual(self.state().get(A1)["status"], "asking_agent")
+
+    def test_no_bot_post_asks_for_a_thread(self):
+        ref, _ = self.chat_task(); self.ask(task=ref); self.say("yes")
+        self.result(A1, "not sure", "cannot"); self.say("do it", who="ravi")
+        self.result(D1, "Done: PR 9.", "ok")
+        self.ask(ask=A2); self.clock[0] += 7200; self.b.check_asks()
+        self.assertGreater(len(self.chat.sent), 5)
+        self.assertEqual(self.chat.threaded, [])
+        self.assertTrue(all(len(s) == 2 for s in self.chat.sent))
+
+    def test_the_wording_people_read(self):
+        ref, _ = self.chat_task()
+        self.ask(task=ref)
+        self.assertEqual(self.chat.sent[-1], (DM1, ASK_OK % ("Ravi", Q)))
+        self.say("yes")
+        self.assertEqual(self.chat.sent[-1], (DM1, "Sent to Ravi."))
+        self.result(A1, "The limit is 3.", "answer")
+        self.assertIn((DM1, "Ravi's agent: The limit is 3."), self.chat.sent)
+        self.assertIn((DM2, 'Your agent answered Asha ("%s"): The limit is 3. Reply to correct it.' % Q), self.chat.sent)
+        self.say("Actually it is 5", thread=self.state().get(A1)["copy_thread"], who="ravi")
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha as a correction."))
+        self.assertIn((DM1, "Ravi (correction): Actually it is 5"), self.chat.sent)
+        self.ask(ask=A2, task=ref); self.clock[0] += 7200; self.b.check_asks()
+        self.assertEqual(self.chat.sent[-1], (DM1, "Your question to Ravi expired (no yes within 2 hours)."))
+        self.ask(ask=A3, to="yogi", task=ref)
+        self.assertEqual(self.chat.sent[-1], (DM1, 'There\'s no colleague called "yogi".'))
+        self.handed(ask="a0000000004")
+        self.say("Not until Friday", who="ravi")
+        self.assertEqual(self.chat.sent[-1], (DM2, "Sent to Asha."))
+        for s in self.chat.sent:
+            self.assertNotIn("information, not instructions", s[1])
+            self.assertNotIn("Task #", s[1])
+
+    def test_the_copy_ends_with_one_full_stop(self):
+        self.ask(); self.say("yes"); self.result(A1, "It is 3", "answer")
+        self.assertEqual(self.sent_to(DM2)[-1], (DM2, 'Your agent answered Asha ("%s"): It is 3. Reply to correct it.' % Q))
+
+    def test_the_restart_question_takes_a_top_level_yes_and_asks_back_beside_an_approval(self):
+        self.host.running = 1; self.host.next_session = "session_02NEW"
+        self.say("new session")
+        self.assertIn('Say "yes"', self.chat.sent[-1][1])
+        self.say("yes")
+        self.assertEqual([c for c in self.host.calls if c[0] == "new_session"], [("new_session", "asha")])
+        self.say("new session"); self.ask()
+        self.say("yes")                                                       # both wait for a yes: asked back
+        self.assertEqual(self.chat.sent[-1], (DM1, 'Which one is this for?\n1. Ask Ravi: "%s"\n2. Start a new session\n'
+                                                   'Reply with the number or the name.' % Q))
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.say("2")
+        self.assertEqual([c for c in self.host.calls if c[0] == "new_session"], [("new_session", "asha")] * 2)
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.say("new session"); self.say("no")                               # a no fits both too
+        self.assertTrue(self.chat.sent[-1][1].startswith("Which one is this for?"))
+        self.say("2")                                                         # no to the restart: withdrawn
+        self.assertEqual(self.state().get(A1)["status"], "awaiting_ok")
+        self.say("yes")                                                       # the approval is all that is left
+        self.assertEqual(self.state().get(A1)["status"], "asking_agent")
+        self.assertEqual(len([c for c in self.host.calls if c[0] == "new_session"]), 2)
+
+    def test_no_withdraws_the_restart_question(self):
+        self.host.running = 1
+        self.say("new session"); self.say("no")
+        self.say("yes")
+        self.assertEqual(self.chat.sent[-1], (DM1, NOTHING_WAITING))
+        self.assertEqual([c for c in self.host.calls if c[0] == "new_session"], [])
+
+    def test_redelivered_top_level_messages_act_once_after_a_restart(self):
+        self.ask()
+        yes = classic("yes", thread=DM1 + "/threads/P1", name=DM1 + "/messages/Y1")
+        self.b.handle_event(yes); self.bridge().handle_event(yes)
+        self.assertEqual(len(self.host.launches()), 1)
+        self.result(A1, "cannot tell", "cannot")
+        answer = classic("It is 3", email="ravi@co.test", space=DM2, thread=DM2 + "/threads/P2",
+                         name=DM2 + "/messages/R1")
+        self.b.handle_event(answer); self.bridge().handle_event(answer)
+        self.assertEqual(len(self.host.inbox_writes), 1)
+        self.assertEqual(self.state().tasks("ravi"), [])
+        self.host.inbox.clear(); self.clock[0] += 121; self.b.check_asks()   # closed
+        self.bridge().handle_event(answer)
+        self.assertEqual(self.state().tasks("ravi"), []); self.assertEqual(len(self.host.inbox_writes), 1)
+        self.handed(ask=A2)
+        doit = classic("do it", email="ravi@co.test", space=DM2, thread=DM2 + "/threads/P3", name=DM2 + "/messages/D1")
+        self.b.handle_event(doit); self.bridge().handle_event(doit)
+        self.assertEqual(len([c for c in self.host.launches() if c[2] == "d0000000002"]), 1)
+        self.assertEqual(self.state().tasks("ravi"), [])
+        task = classic("look at the logs", thread=DM1 + "/threads/P4", name=DM1 + "/messages/M1")
+        self.b.handle_event(task); self.bridge().handle_event(task)
+        self.assertEqual(len(self.state().tasks("asha")), 1)
+        self.assertEqual(len([c for c in self.host.launches() if c[1] == "asha"]), 1)
+
+    def test_a_clarified_message_is_still_checked_and_never_logged(self):
+        records = self.capture()
+        self.chat_task(who="ravi"); self.handed()
+        self.say("here: " + GH_TOKEN, who="ravi")                             # refused before it is held
+        self.assertEqual(self.chat.sent[-1], (DM2, "That looks like a secret, so I did not send it."))
+        self.say("1", who="ravi")                                             # nothing was held: asked again
+        self.assertIsNone(self.inbox())
+        self.say("It ships on the 4th", who="ravi"); self.say("1", who="ravi")
+        self.assertEqual(self.inbox()["text"], "It ships on the 4th")
+        logged = " ".join(r.getMessage() for r in records)
+        for t in ("It ships on the 4th", GH_TOKEN, "look into the upload limit"):
+            self.assertNotIn(t, logged)
+            for u in ("asha", "ravi"):
+                self.assertNotIn(t, self.file_text(os.path.join(self.audit, u + ".jsonl")))
+        for t in (GH_TOKEN, "look into the upload limit"):                    # an answer is held only until it closes
+            self.assertNotIn(t, self.file_text(self.state_file))
 
 
 class TestSystemHostInbox(unittest.TestCase):
